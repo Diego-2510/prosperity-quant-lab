@@ -340,11 +340,3 @@ Sections in the script (numbered comments at the top of each):
 - **Parameter discovery is best-effort**: heuristic `CONFIG`-dict
   support is intentionally conservative; prefer `PARAM_SPEC`.
 
----
-
-Sign conventions, product names, limits, and round layouts are all
-sourced from `Prosperity.txt`. Architecture ideas — block structure of
-`Trader.run`, EMA/linear-regression fair values, inventory skew, order
-clipping — are inspired by the publicly available IMC Prosperity 3
-second-place write-up (see `README.md` / `FrankfurtHedgehogs_polished.txt`
-in the parent Space), but never treated as authoritative P4 facts.
