@@ -1194,7 +1194,7 @@ def run_backtest_on_series(
                 idx = np.where(~mask, np.arange(len(arr)), 0)
                 np.maximum.accumulate(idx, out=idx)
                 arr = arr[idx]
-                clean[p] = arr
+            clean[p] = arr
         products = list(clean.keys())
         T = min(len(clean[p]) for p in products) if products else 0
         if max_ticks is not None and max_ticks > 0:

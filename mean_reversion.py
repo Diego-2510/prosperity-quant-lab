@@ -25,11 +25,29 @@ Parameters (tunable via the backtester's grid search)
 ``entry_sigma``     Number of standard deviations away from the rolling
                     mean that triggers an entry.
 ``sigma_gap``       Reduction of the entry z-score that triggers the
-                    exit -- determines the expected return per trade
+                    exit -- determines the expected return per round-trip
                     (gap between entry and exit in sigma units).
 ``max_hold_ticks``  Maximum number of ticks a position is held before
-                    it is forcibly flattened.
-``window``          Rolling window size used for mean and std.
+                    it is forcibly flattened (loss cap).
+``window``          Rolling window (in ticks) used for mean and std.
+
+Parameter grid
+--------------
+The ``PARAM_SPEC`` below declares a *coarse* grid with 0.25-sigma spacing
+on the continuous parameters and a balanced geometric spacing on the
+integer parameters. For the final parameter search, run the backtester
+with ``--ctf --ctf-n-interp 24`` -- the fine stage then inserts 24
+equidistant points between each pair of top-region values, which yields:
+
+* ``entry_sigma`` / ``sigma_gap`` : **step 0.01 sigma** (0.25 / 25)
+* ``max_hold_ticks`` / ``window`` : **step 1-2 ticks** in the dense regions
+
+Coarse grid sizes:
+* entry_sigma     : 9 values   (1.00 .. 3.00, step 0.25)
+* sigma_gap       : 12 values  (0.25 .. 3.00, step 0.25)
+* max_hold_ticks  : 11 values  (10 .. 1000)
+* window          : 8 values   (10 .. 500)
+* total combos    : 9504
 
 All order sign conventions follow Prosperity 4:
 positive ``Order.quantity`` = BUY, negative = SELL.
@@ -48,11 +66,27 @@ class Trader:
     DEFAULT_LIMIT = 50
 
     # Grid-search parameter registry (picked up by the backtester).
+    # Coarse grid -- combine with ``--ctf --ctf-n-interp 24`` to reach a
+    # 0.01-sigma resolution on the continuous parameters in the fine stage.
     PARAM_SPEC: Dict[str, Dict[str, Any]] = {
-        "entry_sigma":    {"type": "float", "grid": [1.5, 2.0, 2.5, 3.0]},
-        "sigma_gap":      {"type": "float", "grid": [0.5, 1.0, 1.5, 2.0]},
-        "max_hold_ticks": {"type": "int",   "grid": [50, 100, 200, 400]},
-        "window":         {"type": "int",   "grid": [50, 100, 200]},
+        "entry_sigma": {
+            "type": "float",
+            # 1.00, 1.25, 1.50, ..., 3.00 -> 9 values
+            "grid": [round(1.00 + 0.25 * i, 2) for i in range(9)],
+        },
+        "sigma_gap": {
+            "type": "float",
+            # 0.25, 0.50, ..., 3.00 -> 12 values
+            "grid": [round(0.25 + 0.25 * i, 2) for i in range(12)],
+        },
+        "max_hold_ticks": {
+            "type": "int",
+            "grid": [10, 25, 50, 100, 150, 200, 300, 500, 750, 1000, 2000],
+        },
+        "window": {
+            "type": "int",
+            "grid": [10, 25, 50, 100, 150, 200, 300, 500],
+        },
     }
 
     # Instance-level defaults (overwritten by the backtester via setattr
