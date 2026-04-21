@@ -4,42 +4,44 @@
 round3_backtest_montecarlo.py
 ==============================
 
-Prosperity-4 Round-3 Backtesting + Monte-Carlo + Grid-Search Framework.
+Prosperity-4 round-agnostic backtesting + Monte-Carlo + grid-search framework.
 
-Quellen:
-- Autoritativ für P4-Regeln:   Prosperity.txt   (im Space)
-- Referenz-Muster aus P3 (nur Architektur/Heuristik, KEINE Produktfakten):
-  README.md und FrankfurtHedgehogs_polished.txt
+Sources of truth:
+- P4 rules:                Prosperity.txt (in the workspace)
+- P3 reference patterns:   README.md and FrankfurtHedgehogs_polished.txt
+  (architecture / heuristics only -- NEVER treated as P4 facts)
 
-Kernbausteine:
-    1) file discovery / parsing (offizielle Prosperity-CSVs + generischer JSON-Fallback)
-    2) datamodel compatibility layer (lokale Minimalversionen von OrderDepth/Order/TradingState)
-    3) order book normalization
-    4) prosperity fill engine (EXACT + APPROX, Sign-Konvention, Limit-Aggregation)
-    5) trader wrapper (dynamischer Import falls vorhanden; sonst generischer Default-Trader)
-    6) feature engineering
-    7) Monte-Carlo path generation (block bootstrap -> residual bootstrap -> jump-aware)
-    8) parameter registry + coarse-to-fine grid search
-    9) metrics (profit, drawdown, VaR, CVaR, turnover, robust stability)
-    10) pareto frontier + robust top-2 selection
+Pipeline sections:
+    1)  file discovery / parsing (official Prosperity CSVs, generic CSV fallback)
+    2)  datamodel compatibility layer
+        (local minimal Order / OrderDepth / TradingState if no `datamodel`)
+    3)  order-book normalization + mid / micro price
+    4)  Prosperity-compatible fill engine
+        (EXACT + APPROX, sign convention, aggregated side limit check)
+    5)  trader wrapper
+        (loads external Trader by file path; otherwise uses DefaultMarketMaker)
+    6)  feature engineering + diagnostics
+    7)  Monte-Carlo path generation
+        (block bootstrap -> residual bootstrap -> jump-aware perturbation)
+    8)  parameter registry + single-stage / two-stage coarse-to-fine grid search
+    9)  metrics (profit, drawdown, VaR, CVaR, turnover, stability)
+    10) Pareto frontier + robust top-2 selection via neighborhood stability
     11) visualization
     12) artifact export
 
-Ausführung:
+Usage:
     python round3_backtest_montecarlo.py --data-dir ./data --out-dir ./bt_out \
         [--trader path/to/trader.py] [--n-paths 1000] [--seed 42]
 
-Keine externen Abhängigkeiten außer numpy, pandas, matplotlib.
-Python 3.12 kompatibel.
+Runtime dependencies: numpy, pandas, matplotlib. Python 3.12 compatible.
 
-SIGN-KONVENTION (P4, autoritativ aus Prosperity.txt):
-    - sell_orders im OrderDepth haben NEGATIVE Volumina.
-    - positive Order.quantity = Buy, negative Order.quantity = Sell.
-    - Wenn aggregierte Buys ODER aggregierte Sells einer Seite eines Produkts
-      das absolute Positionslimit verletzen würden, wird diese Seite komplett
-      verworfen.
-    - traderData ist die einzige Persistenz zwischen Iterationen.
-    - Unausgeführte Reste bleiben bis zum Iterationsende als eigene Quotes.
+SIGN CONVENTION (P4, authoritative from Prosperity.txt):
+    - OrderDepth.sell_orders values are NEGATIVE volumes.
+    - Order.quantity > 0 = buy,  Order.quantity < 0 = sell.
+    - If aggregated buys OR aggregated sells of one product side would breach
+      the absolute position limit, that entire side is dropped for the product.
+    - traderData is the only persistence between iterations.
+    - Unfilled remainders live as own resting quotes until end of iteration.
 """
 
 from __future__ import annotations
@@ -77,27 +79,27 @@ warnings.filterwarnings("ignore")
 # 0. GLOBAL CONFIG / ASSUMPTIONS
 # =============================================================================
 
-# ASSUMPTION: Round-3-Produkt-Liste, Limits und Felder sind aus den verfügbaren
-# Space-Dateien NICHT ableitbar. Daher wird das Framework produkt-agnostisch
-# gebaut; Produkte + Limits werden aus den geladenen Daten bzw. aus einer
-# optionalen CLI/Config-Datei gezogen. Kein Produktname aus P3 wird als P4-Fakt
-# behandelt.
-DEFAULT_POSITION_LIMIT = 50  # ASSUMPTION: Fallback nur wenn Daten kein Limit liefern.
+# ASSUMPTION: product list, limits and fields are not derivable from the
+# space files alone. The framework stays product-agnostic; products and
+# limits come from the loaded data (or a trader's LIMIT attribute, or an
+# optional CLI override). No P3 product name is treated as a P4 fact.
+DEFAULT_POSITION_LIMIT = 50  # ASSUMPTION: fallback only when data yields no limit.
 
-# ASSUMPTION: Bei offiziellen Prosperity-CSVs liegt typischerweise ein
-# Zeitraster von 100-ms-Ticks ("timestamp" in Schritten von 100) vor.
-# Das Framework greift aber nur auf die numerische Reihenfolge zu.
+# ASSUMPTION: official Prosperity CSVs use a 100-ms tick grid (timestamp in
+# steps of 100). The framework only relies on numeric ordering.
 TICK_STEP = 100
 
-# Fill-Modus-Flag: wird zur Laufzeit gesetzt.
-FILL_MODE = "APPROX"  # wird bei verfügbarem L1/L2-Orderbuch auf "EXACT" gehoben.
+# Fill-mode flag: set at runtime. Promoted to "EXACT" when L1/L2 order books
+# are available for the current backtest run.
+FILL_MODE = "APPROX"
 
 
 # =============================================================================
 # 1. DATAMODEL COMPATIBILITY LAYER
 # =============================================================================
-# Minimalversionen, die mit dem offiziellen Prosperity-datamodel kompatibel sind.
-# Wenn "datamodel" verfügbar ist (z. B. via IMC-Sandbox), wird es bevorzugt.
+# Minimal local versions that are compatible with the official Prosperity
+# `datamodel`. If that module is importable (e.g. inside the IMC sandbox),
+# it is preferred over the local fallbacks.
 
 try:
     from datamodel import (  # type: ignore
@@ -125,8 +127,8 @@ except Exception:  # pragma: no cover
 
     class OrderDepth:  # type: ignore[no-redef]
         def __init__(self) -> None:
-            # buy_orders: price -> positive volume
-            # sell_orders: price -> NEGATIVE volume (P4-Konvention)
+            # buy_orders:  price -> positive volume
+            # sell_orders: price -> NEGATIVE volume (P4 sign convention)
             self.buy_orders: Dict[int, int] = {}
             self.sell_orders: Dict[int, int] = {}
 
@@ -160,9 +162,9 @@ except Exception:  # pragma: no cover
 # 2. FILE DISCOVERY / PARSING
 # =============================================================================
 
-# Matche beliebige Runden + beliebige Tages-Suffixe (z.B. day_0, day_-1, day_-1-6).
-# Erste ganze Zahl nach 'day' ist der DAY; optionale weitere Zahlen werden als
-# Datei-Version/Upload-Suffix betrachtet.
+# Match arbitrary rounds and arbitrary day suffixes (e.g. day_0, day_-1, day_-1-6).
+# The first integer after 'day' is the DAY; any additional trailing integers
+# are treated as file/upload version suffixes.
 PRICES_FILE_RE = re.compile(
     r"prices?_round[_-]?(-?\d+)[_-]?day[_-]?(-?\d+)(?:[_-]\d+)?\.csv$", re.IGNORECASE
 )
@@ -176,10 +178,10 @@ def discover_files(
     data_dir: Path,
     round_filter: Optional[int] = None,
 ) -> Dict[str, List[Path]]:
-    """Finde Prosperity-Preis-/Trade-Dateien + generische Fallback-CSVs.
+    """Discover Prosperity price / trade CSVs plus generic fallback CSVs.
 
-    Falls round_filter gesetzt ist, werden nur Dateien dieser Round zurueckgegeben.
-    data_dir darf auch Einzeldatei oder nicht-existent sein."""
+    If ``round_filter`` is set, only files of that round are returned.
+    ``data_dir`` may be a single file, a directory, or non-existent."""
     prices: List[Path] = []
     trades: List[Path] = []
     others: List[Path] = []
@@ -204,7 +206,7 @@ def discover_files(
 
 
 def _read_prosperity_csv(path: Path) -> pd.DataFrame:
-    """Prosperity-CSVs nutzen ';' als Delimiter; fallback auf ','."""
+    """Prosperity CSVs use ';' as delimiter; fall back to ','."""
     try:
         df = pd.read_csv(path, sep=";")
         if df.shape[1] == 1:  # wrong delimiter
@@ -216,7 +218,7 @@ def _read_prosperity_csv(path: Path) -> pd.DataFrame:
 
 
 def load_prices(paths: List[Path]) -> pd.DataFrame:
-    """Lädt + konkateniert Preis-Snapshots. Standardspalten (offizielles Format):
+    """Load and concatenate price snapshots. Standard columns (official format):
     day, timestamp, product, bid_price_1..3, bid_volume_1..3,
     ask_price_1..3, ask_volume_1..3, mid_price, profit_and_loss.
     """
@@ -227,11 +229,12 @@ def load_prices(paths: List[Path]) -> pd.DataFrame:
         df = _read_prosperity_csv(p)
         if "day" not in df.columns:
             m = PRICES_FILE_RE.search(p.name)
-            # Gruppe 2 = day (Gruppe 1 = round).
+            # group(2) = day, group(1) = round.
             df["day"] = int(m.group(2)) if m else 0
         dfs.append(df)
     out = pd.concat(dfs, ignore_index=True)
-    # ask_volume_x ist positiv; wir konvertieren spaeter in negative sell_orders.
+    # ask_volume_x is positive in the CSVs; we convert to negative sell_orders
+    # later during order-book normalization.
     return out
 
 
@@ -249,7 +252,7 @@ def load_trades(paths: List[Path]) -> pd.DataFrame:
 
 
 def prices_to_order_depths(prices_df: pd.DataFrame) -> Dict[Tuple[int, int], Dict[str, OrderDepth]]:
-    """Konvertiere Preisspalten zu OrderDepth-Objekten pro (day, timestamp)."""
+    """Convert price columns into OrderDepth objects per (day, timestamp)."""
     out: Dict[Tuple[int, int], Dict[str, OrderDepth]] = {}
     if prices_df.empty:
         return out
@@ -273,7 +276,7 @@ def prices_to_order_depths(prices_df: pd.DataFrame) -> Dict[Tuple[int, int], Dic
             px = d.get(pc)
             vol = d.get(vc)
             if pd.notna(px) and pd.notna(vol) and vol != 0:
-                # Prosperity-Konvention: sell_orders sind negativ.
+                # Prosperity sign convention: sell_orders are negative.
                 depth.sell_orders[int(px)] = -abs(int(vol))
         out.setdefault(key, {})[prod] = depth
     return out
@@ -311,46 +314,46 @@ def micro_price(depth: OrderDepth) -> Optional[float]:
 # 4. PROSPERITY-KOMPATIBLE FILL ENGINE
 # =============================================================================
 #
-# Regeln (Prosperity.txt):
-# - Orders matchen sofort gegen resting Quotes mit passendem Preis.
-# - Ausführung zu Preisen der resting Orders.
-# - Unfilled Reste bleiben bis Ende der Iteration als eigene Quotes und
-#   können vom Bot-Flow getroffen werden (APPROX: wir modellieren das
-#   konservativ über nächsten Tick-Mid-Crossing).
-# - Aggregiertes Limit-Check pro Seite: wenn Buys oder Sells eines Produkts
-#   aggregiert das absolute Positionslimit reißen wuerden, werden ALLE Orders
-#   dieser Seite verworfen.
+# Rules (Prosperity.txt):
+# - Orders match immediately against resting quotes at or better than the order's price.
+# - Execution happens at the price of the resting order.
+# - Unfilled remainders live as own resting quotes until end of iteration and
+#   may be hit by bot flow (APPROX mode models this conservatively via a
+#   next-tick mid-crossing heuristic).
+# - Aggregated side limit check: if aggregated buys OR aggregated sells of a
+#   product would breach the absolute position limit, that side is discarded
+#   entirely for this product.
 
 
 @dataclass
 class FillResult:
     product: str
     price: int
-    quantity: int  # signed: +buy, -sell (vom Trader-Perspektive)
+    quantity: int  # signed: +buy, -sell (from the trader's perspective)
     timestamp: int
 
 
 def _aggregate_side_limit_check(
     orders: List[Order], current_position: int, position_limit: int
 ) -> List[Order]:
-    """Implementiert die Prosperity-Regel: wenn aggregierte Buys bzw. Sells
-    das absolute Positionslimit verletzen wuerden, werden ALLE Orders dieser
-    Seite dieses Produkts verworfen."""
+    """Enforce the Prosperity rule: if aggregated buys (or aggregated sells) of
+    one side would breach the absolute position limit, that entire side of the
+    product is discarded."""
     buys = [o for o in orders if o.quantity > 0]
     sells = [o for o in orders if o.quantity < 0]
     buy_sum = sum(o.quantity for o in buys)
-    sell_sum = sum(o.quantity for o in sells)  # negativ
-    # Nach Aggregation darf current_position + buy_sum <= +limit sein.
-    # Und current_position + sell_sum >= -limit sein.
+    sell_sum = sum(o.quantity for o in sells)  # negative
+    # After aggregation we require: current_position + buy_sum  <= +limit
+    #                         and: current_position + sell_sum >= -limit.
     kept: List[Order] = []
     if buys:
         if current_position + buy_sum <= position_limit:
             kept.extend(buys)
-        # else: ganze Buy-Seite verworfen
+        # else: entire buy side dropped.
     if sells:
         if current_position + sell_sum >= -position_limit:
             kept.extend(sells)
-        # else: ganze Sell-Seite verworfen
+        # else: entire sell side dropped.
     return kept
 
 
@@ -363,11 +366,11 @@ def simulate_fills_one_tick(
     timestamp: int,
     fill_mode: str = "APPROX",
 ) -> Tuple[List[FillResult], Dict[str, int]]:
-    """Simuliere ein komplettes Matching für einen Tick.
+    """Run full matching for one tick.
 
     Returns
     -------
-    fills : list of FillResult (signed quantity aus Trader-Sicht)
+    fills : list of FillResult (signed quantity from the trader's perspective)
     position_delta : per-product signed delta
     """
     all_fills: List[FillResult] = []
@@ -377,7 +380,7 @@ def simulate_fills_one_tick(
         pos_now = position.get(prod, 0)
         limit = position_limits.get(prod, DEFAULT_POSITION_LIMIT)
 
-        # 1) Side-aggregated limit check (P4-Regel).
+        # 1) Side-aggregated limit check (P4 rule).
         orders = _aggregate_side_limit_check(orders, pos_now, limit)
         if not orders:
             continue
@@ -386,13 +389,13 @@ def simulate_fills_one_tick(
         if depth is None:
             continue
 
-        # Lokale Kopien der Gegenseite, damit wir Volumen abbauen können.
-        sell_book = dict(depth.sell_orders)  # px -> negativ
-        buy_book = dict(depth.buy_orders)  # px -> positiv
+        # Local copies of the opposite sides so we can deplete volumes.
+        sell_book = dict(depth.sell_orders)  # px -> negative
+        buy_book = dict(depth.buy_orders)    # px -> positive
 
         working_pos = pos_now
-        # Sortiere: Buy-Orders nach höchstem Preis zuerst (aggressiv),
-        # Sell-Orders nach niedrigstem Preis zuerst (aggressiv).
+        # Sort so buy orders hit lowest asks first, sell orders hit highest
+        # bids first (priority by aggressiveness).
         orders_sorted = sorted(
             orders, key=lambda o: (-o.price if o.quantity > 0 else o.price)
         )
@@ -401,12 +404,12 @@ def simulate_fills_one_tick(
         for o in orders_sorted:
             qty_left = o.quantity
             if qty_left > 0:
-                # BUY: matche gegen sell_book mit px <= o.price, günstigste zuerst.
+                # BUY: match against sell_book with px <= o.price, cheapest first.
                 for ask_px in sorted(sell_book.keys()):
                     if ask_px > o.price or qty_left <= 0:
                         break
-                    avail = -sell_book[ask_px]  # positiv
-                    # Hardlimit: working_pos + fill <= limit
+                    avail = -sell_book[ask_px]  # positive
+                    # Hard limit: working_pos + fill <= limit.
                     max_by_limit = limit - working_pos
                     take = min(qty_left, avail, max(0, max_by_limit))
                     if take <= 0:
@@ -421,12 +424,13 @@ def simulate_fills_one_tick(
                         del sell_book[ask_px]
                     qty_left -= take
             elif qty_left < 0:
-                # SELL: matche gegen buy_book mit px >= o.price, höchste zuerst.
+                # SELL: match against buy_book with px >= o.price, highest first.
                 for bid_px in sorted(buy_book.keys(), reverse=True):
                     if bid_px < o.price or qty_left >= 0:
                         break
-                    avail = buy_book[bid_px]  # positiv
-                    max_by_limit = limit + working_pos  # working_pos kann positiv sein; Sell -> neue Pos = working_pos - take >= -limit
+                    avail = buy_book[bid_px]  # positive
+                    # Hard limit: sell -> new position = working_pos - take >= -limit.
+                    max_by_limit = limit + working_pos
                     take = min(-qty_left, avail, max(0, max_by_limit))
                     if take <= 0:
                         break
@@ -440,19 +444,18 @@ def simulate_fills_one_tick(
                         del buy_book[bid_px]
                     qty_left += take
 
-            # Reste bleiben als resting quote.
+            # Remainders live on as resting quotes.
             if qty_left != 0:
                 unfilled.append(Order(o.symbol, o.price, qty_left))
 
-        # 2) Unfilled Reste: im APPROX-Modus vereinfachen wir via
-        # "next-tick mid crossing": wenn der nächste Mid den Resting-Preis
-        # aus Sicht des Traders vorteilhaft kreuzt, gehen wir von einem
-        # Teil-Fill aus. EXACT wuerde ein komplettes Bot-Flow-Modell brauchen.
+        # 2) Unfilled remainders: in APPROX mode we model bot flow via a
+        # "next-tick mid crossing" heuristic. EXACT mode would require a
+        # complete bot-flow model.
         nm = next_mid.get(prod)
         if nm is not None and unfilled and fill_mode == "APPROX":
             for o in unfilled:
                 if o.quantity > 0 and nm < o.price - 0.5:
-                    # Unser Bid wird vom Markt angenommen -> Fill zu o.price.
+                    # Our bid is accepted by the market -> fill at o.price.
                     max_by_limit = limit - working_pos
                     take = min(o.quantity, max(0, max_by_limit))
                     if take > 0:
@@ -477,14 +480,14 @@ def simulate_fills_one_tick(
 
 class DefaultMarketMaker:
     """
-    Generischer, parametrisierter Market-Making-Trader.
-    Kompatibel mit Prosperity: stateless, Persistenz nur via traderData.
-    Dient als Default, wenn kein echter Trader-Code übergeben wird.
+    Generic parametrized market-making trader.
+    Prosperity-compatible: stateless, persistence only via ``traderData``.
+    Used as the default when no external trader is supplied.
     """
 
-    # Hook-Name, damit Grid Search weiß, welche Parameter existieren.
-    # mathematical_low: untere Schranke/Floor fuer Fair Value (niemals -inf;
-    # -1e6 wirkt de facto als "kein Floor" fuer Prosperity-Preisniveaus).
+    # Parameter hook the grid-search engine keys off of.
+    # mathematical_low: floor for fair value. Never -inf; -1e6 effectively
+    # means "no floor" for typical Prosperity price levels.
     PARAM_SPEC = {
         "fair_value_window": {"type": "int", "grid": [10, 20, 40, 80]},
         "spread_edge": {"type": "int", "grid": [1, 2, 3, 4]},
@@ -509,7 +512,7 @@ class DefaultMarketMaker:
 
     def _dump_state(self, state: Dict[str, Any]) -> str:
         s = json.dumps(state, separators=(",", ":"))
-        return s[:49_000]  # Prosperity-Limit ~ 50k.
+        return s[:49_000]  # Prosperity soft limit ~ 50k.
 
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
         td = self._load_state(state.traderData)
@@ -528,7 +531,7 @@ class DefaultMarketMaker:
             win = hist[-self.p["fair_value_window"]:]
             fv = float(np.mean(win)) if win else mp
 
-            # Clip via mathematical_low (Floor). Nur greifen, wenn floor > -inf.
+            # Clip via mathematical_low (floor). Only applies if floor > -inf.
             ml = float(self.p["mathematical_low"])
             if math.isfinite(ml):
                 fv = max(fv, ml)
@@ -578,22 +581,50 @@ class DefaultMarketMaker:
 
 
 def load_external_trader(path: Path) -> Optional[Callable]:
-    """Lädt eine externe Trader-Klasse über import; erwartet `class Trader:` mit
-    `run(self, state)`. Falls Import fehlschlägt, Rückgabe None (Default-Trader)."""
+    """Load an external Trader class from a Python file via importlib.
+
+    Supports filenames with hyphens/dots because we load by path rather than
+    module name. Expects ``class Trader:`` with ``run(self, state)``.
+    Returns None on failure -- caller falls back to DefaultMarketMaker.
+
+    Also injects local datamodel shims under the module name ``datamodel``
+    into ``sys.modules`` before import, so traders that ``from datamodel
+    import Order, OrderDepth, TradingState`` work even outside the IMC sandbox.
+    """
     if not path or not path.exists():
         return None
-    spec_name = path.stem
-    sys.path.insert(0, str(path.parent))
+
+    # 1) Make `from datamodel import ...` work for traders loaded in this process.
+    if "datamodel" not in sys.modules:
+        import types as _types
+        dm = _types.ModuleType("datamodel")
+        dm.Order = Order
+        dm.OrderDepth = OrderDepth
+        dm.TradingState = TradingState
+        dm.Trade = Trade
+        dm.Observation = Observation
+        sys.modules["datamodel"] = dm
+
+    # 2) Load by path (handles hyphens, weird names, same-dir collisions).
+    import importlib.util as _ilu
+    mod_name = f"_trader_{re.sub(r'[^0-9A-Za-z_]', '_', path.stem)}_{abs(hash(str(path))) % 10**6}"
     try:
-        mod = __import__(spec_name)
-        TraderCls = getattr(mod, "Trader", None)
-        if TraderCls is None:
-            print(f"[WARN] {path} enthält keine Klasse 'Trader'.")
+        spec = _ilu.spec_from_file_location(mod_name, str(path))
+        if spec is None or spec.loader is None:
+            print(f"[WARN] Could not build importlib spec for {path}")
             return None
-        return TraderCls
-    except Exception as e:  # pragma: no cover
-        print(f"[WARN] Konnte externen Trader nicht laden: {e}")
+        mod = _ilu.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        print(f"[WARN] Failed to import external trader {path}: {e}")
         return None
+
+    TraderCls = getattr(mod, "Trader", None)
+    if TraderCls is None:
+        print(f"[WARN] {path} does not define a class named 'Trader'.")
+        return None
+    return TraderCls
 
 
 # =============================================================================
@@ -602,12 +633,12 @@ def load_external_trader(path: Path) -> Optional[Callable]:
 
 
 def build_feature_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
-    """Grund-Features pro (day, timestamp, product)."""
+    """Basic features per (day, timestamp, product)."""
     if prices_df.empty:
         return pd.DataFrame()
     df = prices_df.copy()
     if "mid_price" not in df.columns:
-        # Rekonstruiere aus bid_price_1 / ask_price_1
+        # Reconstruct from bid_price_1 / ask_price_1.
         bp = df.get("bid_price_1")
         ap = df.get("ask_price_1")
         if bp is not None and ap is not None:
@@ -660,7 +691,9 @@ def feature_diagnostics(features: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 
-def _block_bootstrap_returns(rets: np.ndarray, n: int, block_len: int, rng: np.random.Generator) -> np.ndarray:
+def _block_bootstrap_returns(
+    rets: np.ndarray, n: int, block_len: int, rng: np.random.Generator
+) -> np.ndarray:
     if len(rets) == 0:
         return np.zeros(n)
     out = np.empty(n)
@@ -699,10 +732,10 @@ def generate_monte_carlo_paths(
     seed: int = 42,
     block_len: int = 25,
 ) -> Dict[str, np.ndarray]:
-    """
-    Erzeuge fuer jedes Produkt (n_paths, T)-Matrix von Mid-Price-Pfaden.
-    Reihenfolge: block bootstrap -> residual bootstrap -> jump-aware perturbation.
-    Fuer gekoppelte Produkte: multivariate Reihenfolge via gemeinsame Indizes.
+    """Generate ``(n_paths, T)`` mid-price matrices per product.
+    Generator order: block bootstrap -> residual bootstrap -> jump-aware perturbation.
+    For coupled products we sample via shared time indices so cross-asset
+    correlations are preserved.
     """
     if prices_df.empty:
         return {}
@@ -714,11 +747,11 @@ def generate_monte_carlo_paths(
         .sort_index()
     )
     pv = pv.ffill().bfill()
-    # Droppe Produkte, die komplett leer sind.
+    # Drop products that are entirely empty.
     pv = pv.dropna(axis=1, how="all")
     if pv.empty:
         return {}
-    # Sicherheits-Fallback: verbleibende NaN mit Spalten-Mittelwert fuellen.
+    # Safety net: fill any remaining NaN with the column mean.
     pv = pv.fillna(pv.mean(numeric_only=True))
     products = list(pv.columns)
     T = len(pv)
@@ -730,7 +763,7 @@ def generate_monte_carlo_paths(
     out: Dict[str, np.ndarray] = {p: np.empty((n_paths, T)) for p in products}
 
     for i in range(n_paths):
-        # Indizes fuer block bootstrap ueber die ZEIT-Achse -> Cross-Asset-Korr bleibt erhalten.
+        # Block-bootstrap indices across the TIME axis -> cross-asset correlation preserved.
         sampled_idx = np.empty(T - 1, dtype=np.int64)
         filled = 0
         while filled < T - 1:
@@ -740,7 +773,7 @@ def generate_monte_carlo_paths(
             filled += take
         sampled = rets[sampled_idx]  # (T-1, P)
 
-        # Mische 30% residual bootstrap fuer mehr Diversitaet.
+        # Mix in ~30% residual bootstrap for extra path diversity.
         if rng.random() < 0.3:
             for k in range(sampled.shape[1]):
                 sampled[:, k] = _residual_bootstrap_returns(rets[:, k], len(sampled), rng)
@@ -751,7 +784,7 @@ def generate_monte_carlo_paths(
             jump_frac = float((np.abs(rets[:, k]) > 4 * std_k).mean()) if std_k > 0 else 0.0
             sampled[:, k] = _add_jumps(sampled[:, k], rng, jump_frac, 3 * std_k)
 
-        # Reintegriere zu Preisen, starte an historischem Startpreis.
+        # Re-integrate into prices, anchored at the historical start price.
         log_p0 = np.log(pv.values[0])
         log_path = np.vstack([log_p0, log_p0 + np.cumsum(sampled, axis=0)])
         prices = np.exp(log_path)
@@ -767,15 +800,21 @@ def generate_monte_carlo_paths(
 
 
 def extract_param_spec(trader_cls) -> Dict[str, Any]:
-    """Versucht, aus einer externen Trader-Klasse ein PARAM_SPEC zu extrahieren.
-    Erkennt: class attr PARAM_SPEC (wie hier), sonst CONFIG-dict, sonst nichts."""
+    """Best-effort extraction of a PARAM_SPEC from an external Trader class.
+
+    Detection order:
+      1. Class attribute ``PARAM_SPEC`` (preferred; native format).
+      2. Class attribute ``CONFIG`` (dict of tunable constants).
+         ASSUMPTION: CONFIG values are numeric/bool; we build small grids
+         around each default (+/- 1 step / +/-50% for floats).
+      3. Otherwise: no parameters detected -> return ``{}``. The pipeline
+         will still run a single evaluation against the fixed trader.
+    """
     spec = getattr(trader_cls, "PARAM_SPEC", None)
-    if isinstance(spec, dict):
+    if isinstance(spec, dict) and spec:
         return spec
     cfg = getattr(trader_cls, "CONFIG", None)
-    if isinstance(cfg, dict):
-        # ASSUMPTION: CONFIG-Werte sind numerisch; wir bauen small-range-Grids
-        # um jeden Default (+/- 1 Schritt).
+    if isinstance(cfg, dict) and cfg:
         out = {}
         for k, v in cfg.items():
             if isinstance(v, bool):
@@ -785,11 +824,15 @@ def extract_param_spec(trader_cls) -> Dict[str, Any]:
             elif isinstance(v, float):
                 out[k] = {"type": "float", "grid": sorted(set([v * 0.5, v, v * 1.5]))}
         return out
-    return dict(DefaultMarketMaker.PARAM_SPEC)
+    return {}
 
 
 def build_grid(spec: Dict[str, Any], focus_keys: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     keys = focus_keys if focus_keys else list(spec.keys())
+    if not keys:
+        # Empty spec -> exactly one "combo" with no overrides so the pipeline
+        # still performs a single evaluation of the underlying trader.
+        return [{}]
     grids = [spec[k]["grid"] for k in keys]
     return [dict(zip(keys, combo)) for combo in itertools.product(*grids)]
 
@@ -797,8 +840,8 @@ def build_grid(spec: Dict[str, Any], focus_keys: Optional[List[str]] = None) -> 
 def coarse_to_fine_grid(
     spec: Dict[str, Any], run_batch: Callable[[List[Dict[str, Any]]], pd.DataFrame], top_k: int = 6
 ) -> pd.DataFrame:
-    """Legacy auto-coarse-to-fine (triggert nur bei >500 Kombis). Bleibt fuer
-    Kompatibilitaet erhalten; neuer expliziter Modus: two_stage_ctf()."""
+    """Legacy auto-coarse-to-fine (only triggers when >500 combos). Kept for
+    backward compatibility; the explicit path is :func:`two_stage_ctf`."""
     full = build_grid(spec)
     if len(full) <= 500:
         return run_batch(full)
@@ -839,9 +882,8 @@ def coarse_to_fine_grid(
 
 
 def _refine_numeric_grid(values: Sequence[Any], n_interp: int = 2) -> List[Any]:
-    """Verfeinere eine numerische Wertliste durch Einfuegen von n_interp
-    aequidistanten Punkten zwischen benachbarten Werten. Fuer Bool/Kategorial
-    unveraendert zurueckgeben."""
+    """Refine a numeric value list by inserting ``n_interp`` equidistant points
+    between neighbouring values. Bool / categorical lists are returned unchanged."""
     vals = [v for v in values if v is not None]
     if not vals:
         return list(values)
@@ -860,7 +902,7 @@ def _refine_numeric_grid(values: Sequence[Any], n_interp: int = 2) -> List[Any]:
         for i in range(1, n_interp + 1):
             out.append(a + step * i)
     out.append(nums[-1])
-    # Runde Ints wieder zu Ints, wenn alle Eingabewerte int waren.
+    # Keep the refined grid integer-typed if all inputs were ints.
     if all(isinstance(v, int) and not isinstance(v, bool) for v in vals):
         out = sorted(set(int(round(x)) for x in out))
     else:
@@ -877,19 +919,24 @@ def two_stage_ctf(
     max_top: int = 40,
     n_interp: int = 2,
 ) -> pd.DataFrame:
-    """Expliziter Two-Stage-Coarse-to-Fine-Modus.
+    """Explicit two-stage coarse-to-fine grid search.
 
-    Stufe 1: volles Grid ueber `spec`, ausgewertet mit run_batch_coarse
-             (niedrige MC-Pfad-Anzahl -> schnelle Noise-Schaetzung).
-    Stufe 2: selektiere Top-`top_frac` der Stufe 1, baue PRO KEY die
-             Werte-Menge aus dieser Top-Region, verfeinere numerische Keys
-             durch `_refine_numeric_grid`, bilde das Cross-Product und
-             werte mit run_batch_fine (hoehere MC-Pfad-Anzahl) aus.
+    Stage 1: evaluate the full ``spec`` with ``run_batch_coarse`` (low MC
+             budget -- fast noisy scan of the whole parameter space).
+    Stage 2: pick the top ``top_frac`` rows of stage 1, collect the per-key
+             value sets that appear in the top region, refine numeric keys
+             via :func:`_refine_numeric_grid`, take the cross product and
+             evaluate with ``run_batch_fine`` (higher MC budget).
 
-    Rueckgabe: konkateniertes DataFrame mit Spalte `stage` in {"coarse","fine"}.
+    Returns a concatenated DataFrame with a ``stage`` column in
+    ``{"coarse", "fine"}``.
     """
     coarse_combos = build_grid(spec)
-    print(f"[CTF] Stage-1 coarse grid: {len(coarse_combos)} combos")
+    print(f"[CTF] stage-1 coarse grid: {len(coarse_combos)} combos")
+    if not spec:
+        # Nothing to tune -- single evaluation already covered by coarse run.
+        coarse_df = run_batch_coarse(coarse_combos)
+        return coarse_df.assign(stage="coarse")
     coarse_df = run_batch_coarse(coarse_combos)
     if coarse_df.empty:
         return coarse_df.assign(stage="coarse")
@@ -898,10 +945,10 @@ def two_stage_ctf(
 
     n_top = int(max(min_top, min(max_top, math.ceil(len(coarse_df) * top_frac))))
     top = coarse_df.nlargest(n_top, "objective_score")
-    print(f"[CTF] Stage-1 kept top {len(top)} rows (~{top_frac*100:.0f}%) for refinement")
+    print(f"[CTF] stage-1 kept top {len(top)} rows (~{top_frac*100:.0f}%) for refinement")
 
-    # Baue fine_spec: pro Key nimm die in Top-Region vorkommenden Werte
-    # (plus optionale numerische Verfeinerung).
+    # Build fine_spec: per key take the values that occur in the top region,
+    # plus optional numeric interpolation.
     fine_spec: Dict[str, Any] = {}
     for k, v in spec.items():
         if k not in top.columns:
@@ -918,7 +965,8 @@ def two_stage_ctf(
         fine_spec[k] = {"type": v["type"], "grid": fine_grid}
 
     fine_combos = build_grid(fine_spec)
-    # Dedupe gegen bereits evaluierte coarse-Kombis (exakter Parameter-Match).
+    # Dedupe against combos already evaluated in the coarse stage
+    # (exact parameter-value match).
     coarse_keys = set(
         tuple(sorted((k, coarse_df.iloc[i][k]) for k in spec.keys() if k in coarse_df.columns))
         for i in range(len(coarse_df))
@@ -928,7 +976,7 @@ def two_stage_ctf(
         key = tuple(sorted(c.items()))
         if key not in coarse_keys:
             fine_unique.append(c)
-    print(f"[CTF] Stage-2 fine grid: {len(fine_unique)} new combos (of {len(fine_combos)} generated)")
+    print(f"[CTF] stage-2 fine grid: {len(fine_unique)} new combos (of {len(fine_combos)} generated)")
 
     if not fine_unique:
         return coarse_df
@@ -947,8 +995,9 @@ def two_stage_ctf(
 
 
 def infer_position_limits(prices_df: pd.DataFrame) -> Dict[str, int]:
-    """ASSUMPTION: Ohne explizite P4-Round-3-Limit-Info leiten wir konservativ
-    aus maximalem beobachteten Volumen ab (mind. DEFAULT_POSITION_LIMIT)."""
+    """ASSUMPTION: without authoritative P4 limit info we fall back to a
+    conservative estimate from the largest observed per-snapshot volume,
+    floored at :data:`DEFAULT_POSITION_LIMIT`."""
     if prices_df.empty:
         return {}
     limits: Dict[str, int] = {}
@@ -959,6 +1008,66 @@ def infer_position_limits(prices_df: pd.DataFrame) -> Dict[str, int]:
     return limits
 
 
+def build_market_trades_index(
+    trades_df: pd.DataFrame,
+) -> Dict[Tuple[int, int], Dict[str, List["Trade"]]]:
+    """Group recorded market trades by (day, timestamp) -> product -> List[Trade].
+
+    Prosperity trade CSVs typically contain the columns ``timestamp``,
+    ``symbol`` (or ``product``), ``price``, ``quantity``, ``buyer``,
+    ``seller``, and optionally ``day``. Unknown columns are ignored.
+    Returns an empty dict if the frame is empty or lacks required fields.
+    """
+    index: Dict[Tuple[int, int], Dict[str, List[Trade]]] = {}
+    if trades_df is None or trades_df.empty:
+        return index
+    cols = set(trades_df.columns)
+    sym_col = "symbol" if "symbol" in cols else ("product" if "product" in cols else None)
+    if sym_col is None or "timestamp" not in cols:
+        return index
+    for row in trades_df.itertuples(index=False):
+        d = dict(zip(trades_df.columns, row))
+        try:
+            day = int(d.get("day", 0))
+            ts = int(d.get("timestamp", 0))
+            sym = str(d.get(sym_col))
+            price = float(d.get("price", 0))
+            qty = int(float(d.get("quantity", 0)))
+        except Exception:
+            continue
+        if not sym or sym == "nan":
+            continue
+        buyer = str(d.get("buyer", "") or "")
+        seller = str(d.get("seller", "") or "")
+        tr = Trade(
+            symbol=sym,
+            price=int(round(price)) if float(price).is_integer() else price,  # type: ignore[arg-type]
+            quantity=qty,
+            buyer=buyer,
+            seller=seller,
+            timestamp=ts,
+        )
+        index.setdefault((day, ts), {}).setdefault(sym, []).append(tr)
+    return index
+
+
+def extract_trader_limits(trader_cls) -> Dict[str, int]:
+    """Pull hard position limits from an external Trader class if present.
+
+    Recognized attributes (first match wins): ``LIMIT``, ``LIMITS``,
+    ``POSITION_LIMIT``, ``POSITION_LIMITS``. Value must be a ``dict`` mapping
+    product symbol -> integer limit. Returns ``{}`` if nothing is declared.
+    """
+    for attr in ("LIMIT", "LIMITS", "POSITION_LIMIT", "POSITION_LIMITS"):
+        val = getattr(trader_cls, attr, None)
+        if isinstance(val, dict) and val:
+            try:
+                return {str(k): int(v) for k, v in val.items()}
+            except Exception:
+                continue
+    return {}
+
+
 def run_backtest_on_series(
     trader_cls,
     params: Dict[str, Any],
@@ -967,10 +1076,18 @@ def run_backtest_on_series(
     ordered_keys: Optional[List[Tuple[int, int]]],
     position_limits: Dict[str, int],
     max_ticks: Optional[int] = None,
+    market_trades_index: Optional[Dict[Tuple[int, int], Dict[str, List["Trade"]]]] = None,
 ) -> Dict[str, Any]:
-    """Führt einen Backtest aus.
-    Wenn historical_depths + ordered_keys gegeben: EXACT-Modus (nutzt echte Orderbücher).
-    Sonst: APPROX-Modus auf Mid-Serien (synthetisches Orderbuch Bid=mid-1, Ask=mid+1).
+    """Run a single backtest pass.
+
+    If ``historical_depths`` and ``ordered_keys`` are provided the run uses
+    EXACT-fill mode against the real recorded order books. Otherwise it falls
+    back to APPROX-fill mode against the per-product mid-price series, with a
+    synthetic order book at Bid=floor(mid-1) / Ask=ceil(mid+1).
+
+    If ``market_trades_index`` is provided (mapping (day, timestamp) ->
+    {product: List[Trade]}), the trader receives populated ``market_trades``
+    on every tick (EXACT mode only). Otherwise ``market_trades`` stays empty.
     """
     global FILL_MODE
 
@@ -980,13 +1097,13 @@ def run_backtest_on_series(
     else:
         try:
             trader = trader_cls()
-            # Setze Parameter dynamisch.
+            # Set parameters dynamically on the trader instance.
             for k, v in params.items():
                 try:
                     setattr(trader, k, v)
                 except Exception:
                     pass
-            # Manche externen Trader nutzen CONFIG-dict:
+            # Some external traders keep parameters in a CONFIG dict.
             cfg = getattr(trader, "CONFIG", None)
             if isinstance(cfg, dict):
                 for k, v in params.items():
@@ -1023,13 +1140,16 @@ def run_backtest_on_series(
         for i, k in enumerate(keys):
             depths = historical_depths[k]
             ts = k[1]
+            mt_for_tick = (
+                market_trades_index.get(k, {}) if market_trades_index else {}
+            )
             state = TradingState(
                 traderData=traderData,
                 timestamp=ts,
                 listings={},
                 order_depths=depths,
                 own_trades={},
-                market_trades={},
+                market_trades=mt_for_tick,
                 position=dict(position),
                 observations=Observation(),
             )
@@ -1045,10 +1165,10 @@ def run_backtest_on_series(
                 orders_out, depths, dict(position), position_limits, next_mid_cache[i], ts, "EXACT"
             )
             for f in fills:
-                cash -= f.price * f.quantity  # buy -> cash runter
+                cash -= f.price * f.quantity  # buy reduces cash
                 turnover += abs(f.price * f.quantity)
                 position[f.product] += f.quantity
-            # Mark-to-market via aktuellem Mid.
+            # Mark-to-market at the current mid.
             mtm = 0.0
             for p, pos in position.items():
                 dp = depths.get(p)
@@ -1060,15 +1180,15 @@ def run_backtest_on_series(
             inventory_series.append(sum(abs(v) for v in position.values()))
     else:
         FILL_MODE = "APPROX"
-        # Synthetisches Orderbuch aus Mid.
+        # Build a synthetic order book from the mid series.
         products = list(mids_by_product.keys())
-        # Filtere NaNs pro Produkt
+        # Filter NaNs per product.
         clean: Dict[str, np.ndarray] = {}
         for p in products:
             arr = np.asarray(mids_by_product[p], dtype=float)
             if arr.size == 0 or np.all(np.isnan(arr)):
                 continue
-            # forward-fill NaNs
+            # Forward-fill NaNs.
             mask = np.isnan(arr)
             if mask.any():
                 idx = np.where(~mask, np.arange(len(arr)), 0)
@@ -1155,7 +1275,7 @@ def aggregate_path_metrics(
     cvar_5 = float(per_path_profits[per_path_profits <= var_5].mean()) if np.any(per_path_profits <= var_5) else var_5
     worst = float(per_path_profits.min())
 
-    # Normalisierung (gegen Cross-Parameter-Vergleichbarkeit innerhalb desselben Grids).
+    # Normalization (keep the score comparable across grid combinations).
     norm_mean = mean_p
     norm_var = var_p
     score = norm_mean - risk_lambda * norm_var
@@ -1173,8 +1293,8 @@ def aggregate_path_metrics(
 
 
 def pareto_frontier(df: pd.DataFrame, x_col: str, y_col: str, maximize_y: bool = True) -> pd.DataFrame:
-    """Pareto: wir wollen mean_profit MAX und variance MIN.
-    Hier x=variance (min), y=mean_profit (max)."""
+    """Pareto frontier: we want mean_profit MAX and variance MIN.
+    Here x=variance (min), y=mean_profit (max)."""
     if df.empty:
         return df
     s = df.sort_values([x_col, y_col], ascending=[True, not maximize_y])
@@ -1189,18 +1309,19 @@ def pareto_frontier(df: pd.DataFrame, x_col: str, y_col: str, maximize_y: bool =
 
 
 def pick_top2_robust(full_results: pd.DataFrame) -> pd.DataFrame:
-    """Robuste Top-2-Auswahl: Pareto + lokale Stabilität.
-    Stabilität = mittleres objective_score der Nachbarn im Grid.
+    """Robust Top-2 selection combining global score and neighbourhood
+    stability. Stability is measured as the mean objective_score across the
+    nearest neighbours in (normalised) parameter space.
     """
     if full_results.empty:
         return full_results
     df = full_results.copy()
-    # Normalisierung fuer robuste Metrik.
+    # Normalise for the robust score.
     df["obj_norm"] = (df["objective_score"] - df["objective_score"].mean()) / (
         df["objective_score"].std() + 1e-9
     )
-    # Nachbar-Score: Mittelwert der nearest-neighbors in Parameterraum (euklidisch
-    # ueber numerische Parameter).
+    # Neighbour score: mean objective of the K nearest neighbours in
+    # numeric-parameter space (Euclidean on z-scored columns).
     num_cols = [
         c for c in df.columns
         if c not in {
@@ -1337,7 +1458,7 @@ def plot_stability(top_k_path_profits: List[np.ndarray], labels: List[str], out:
 def _single_day_keys(
     ordered_keys: List[Tuple[int, int]], exact_days: int
 ) -> List[Tuple[int, int]]:
-    """Begrenze EXACT-Modus auf die ersten exact_days Tage (deterministisch)."""
+    """Restrict EXACT mode to the first ``exact_days`` days (deterministic)."""
     if not ordered_keys or exact_days <= 0:
         return []
     days_seen: List[int] = []
@@ -1380,8 +1501,8 @@ def run_pipeline(
     prices_df = load_prices(files["prices"])
     trades_df = load_trades(files["trades"])
 
-    # Fallback: wenn kein Round-3-Match, akzeptiere generische CSVs mit
-    # Spalten {timestamp, product, mid_price}.
+    # Fallback: if no round-specific match, accept generic CSVs with at
+    # least the columns {timestamp, product, mid_price}.
     if prices_df.empty and files["others"]:
         frames = []
         for p in files["others"]:
@@ -1398,9 +1519,10 @@ def run_pipeline(
             prices_df = pd.concat(frames, ignore_index=True)
 
     if prices_df.empty:
-        # ASSUMPTION: Daten fehlen. Erzeuge synthetischen 3-Pfad-Datensatz
-        # damit der Lauf demonstrativ ablaeuft und der Monte-Carlo-Teil testbar ist.
-        print("[WARN] Keine Prosperity-Daten gefunden. Erzeuge synthetischen Fallback (3 Tage, 1 Produkt).")
+        # ASSUMPTION: no data found. Generate a synthetic 3-day, 1-product
+        # dataset so the pipeline still runs end-to-end and the Monte-Carlo
+        # section remains testable.
+        print("[WARN] No Prosperity data found. Falling back to synthetic data (3 days, 1 product).")
         rng = np.random.default_rng(seed)
         days = []
         T = 1000
@@ -1427,10 +1549,10 @@ def run_pipeline(
     position_limits = infer_position_limits(prices_df)
     print(f"[INFO] inferred position limits: {position_limits}")
 
-    # -- Historical depths (EXACT falls moeglich).
+    # -- Historical depths (EXACT fill when possible).
     historical_depths = prices_to_order_depths(prices_df)
     ordered_keys_all = sorted(historical_depths.keys())
-    # Default: EXACT-Modus auf exact_days Tage begrenzen (deutlich schneller).
+    # By default restrict EXACT mode to ``exact_days`` days (much faster).
     ordered_keys = _single_day_keys(ordered_keys_all, exact_days)
     if max_ticks is not None and max_ticks > 0 and len(ordered_keys) > max_ticks:
         ordered_keys = ordered_keys[:max_ticks]
@@ -1447,9 +1569,22 @@ def run_pipeline(
     trader_cls = load_external_trader(trader_path) if trader_path else None
     if trader_cls is None:
         trader_cls = DefaultMarketMaker
-        print("[INFO] Verwende DefaultMarketMaker (kein externer Trader).")
+        print("[INFO] Using DefaultMarketMaker (no external trader specified).")
     else:
-        print(f"[INFO] Verwende externen Trader: {trader_cls.__name__}")
+        print(f"[INFO] Using external trader: {trader_cls.__name__}")
+
+    # Override inferred limits with trader-declared limits when provided.
+    trader_limits = extract_trader_limits(trader_cls)
+    if trader_limits:
+        for prod, lim in trader_limits.items():
+            position_limits[prod] = int(lim)
+        print(f"[INFO] trader-declared position limits applied: {trader_limits}")
+
+    # Market-trades index (for EXACT-mode traders that use state.market_trades).
+    market_trades_index = build_market_trades_index(trades_df)
+    if market_trades_index:
+        n_products = sum(1 for _ in market_trades_index.values())
+        print(f"[INFO] built market_trades index for {n_products} ticks")
 
     # -- Parameter registry.
     spec = extract_param_spec(trader_cls)
@@ -1488,6 +1623,7 @@ def run_pipeline(
                     ordered_keys=ordered_keys if have_exact else None,
                     position_limits=position_limits,
                     max_ticks=max_ticks,
+                    market_trades_index=market_trades_index if have_exact else None,
                 )
             else:
                 hist_res = dict(final_pnl=0.0, max_drawdown=0.0, hit_rate=0.0,
@@ -1562,8 +1698,8 @@ def run_pipeline(
     print("[INFO] Robust Top-2 parameter sets:")
     print(top2.to_string(index=False))
 
-    # -- Visualisierung.
-    # Best-Param historische Equity (einmaliger EXACT-Lauf, kein Grid-Overhead).
+    # -- Visualization.
+    # Historical equity for best params (one EXACT run, no grid overhead).
     if not top2.empty:
         best = top2.iloc[0].to_dict()
         best_params = {k: best[k] for k in spec.keys() if k in best}
@@ -1574,10 +1710,11 @@ def run_pipeline(
             ordered_keys=ordered_keys if have_exact else None,
             position_limits=position_limits,
             max_ticks=max_ticks,
+            market_trades_index=market_trades_index if have_exact else None,
         )
         plot_equity_curve(hist_res["equity_curve"], out_dir / "plot_equity_curve.png")
 
-        # Fan chart + final pnl dist fuer best params.
+        # Fan chart + final PnL distribution for the best params.
         path_curves = []
         finals = []
         for i in range(min(eval_paths_final, n_paths)):
@@ -1600,7 +1737,7 @@ def run_pipeline(
     plot_top_ranking(full_results, out_dir / "plot_top_ranking.png")
     plot_sensitivity_math_low(full_results, out_dir / "plot_sensitivity_mathematical_low.png")
 
-    # Heatmap fuer die 2 staerksten Parameter (nach Varianz der Spalten).
+    # Heatmap for the 2 most informative parameters (by column cardinality).
     num_params = [
         k for k, v in spec.items()
         if k in full_results.columns and pd.api.types.is_numeric_dtype(full_results[k])
@@ -1640,33 +1777,33 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Prosperity-4 MC/Grid Backtester (round-agnostic)")
     ap.add_argument("--data-dir", type=Path, default=Path("./data"))
     ap.add_argument("--out-dir", type=Path, default=Path("./bt_out"))
-    ap.add_argument("--trader", type=Path, default=None, help="Pfad zu externer trader.py")
+    ap.add_argument("--trader", type=Path, default=None, help="Path to an external trader.py.")
     ap.add_argument("--round", dest="round_filter", type=int, default=None,
-                    help="Optionaler Filter auf eine spezifische Round-Nummer (1,2,3,4,5).")
+                    help="Optional filter for a specific round number (1, 2, 3, 4, 5).")
     ap.add_argument("--n-paths", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--risk-lambda", type=float, default=0.5,
-                    help="Risk-Gewichtung in objective_score = mean - lambda*var")
+                    help="Risk weight in objective_score = mean - lambda * variance.")
     ap.add_argument("--max-ticks", type=int, default=2000,
-                    help="Begrenze Ticks pro Backtest-Lauf (0 = kein Limit).")
+                    help="Cap ticks per backtest run (0 = no cap).")
     ap.add_argument("--exact-days", type=int, default=1,
-                    help="Anzahl Tage, die im EXACT-Modus verwendet werden (0 = kein EXACT).")
+                    help="Number of days used in EXACT mode (0 = disable EXACT).")
     ap.add_argument("--eval-paths", type=int, default=50,
-                    help="MC-Pfade pro Grid-Kombination (Speed/Varianz-Tradeoff).")
+                    help="MC paths per grid combination (speed / variance trade-off).")
     ap.add_argument("--eval-paths-final", type=int, default=200,
-                    help="MC-Pfade fuer finale Best-Param-Auswertung und Fan-Chart.")
+                    help="MC paths for the final best-param evaluation and fan chart.")
     ap.add_argument("--grid-with-hist", action="store_true",
-                    help="Fuehre den historischen EXACT-Lauf bei JEDER Grid-Kombi aus (langsam).")
+                    help="Also run the historical EXACT backtest for every grid combo (slow).")
     ap.add_argument("--ctf", action="store_true",
-                    help="Aktiviere Two-Stage Coarse-to-Fine Grid Search.")
+                    help="Enable two-stage coarse-to-fine grid search.")
     ap.add_argument("--ctf-eval-coarse", type=int, default=10,
-                    help="MC-Pfade pro Kombi in der coarse Stage (Default 10).")
+                    help="MC paths per combination in the coarse stage (default 10).")
     ap.add_argument("--ctf-eval-fine", type=int, default=100,
-                    help="MC-Pfade pro Kombi in der fine Stage (Default 100).")
+                    help="MC paths per combination in the fine stage (default 100).")
     ap.add_argument("--ctf-top-frac", type=float, default=0.10,
-                    help="Top-Anteil der coarse Stage fuer die Verfeinerung (Default 0.10).")
+                    help="Fraction of the coarse stage used for refinement (default 0.10).")
     ap.add_argument("--ctf-n-interp", type=int, default=2,
-                    help="Zwischenpunkte zwischen numerischen Top-Werten in der fine Stage (Default 2).")
+                    help="Interpolation points between numeric top values in the fine stage (default 2).")
     return ap.parse_args()
 
 
