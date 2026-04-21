@@ -797,13 +797,12 @@ def build_grid(spec: Dict[str, Any], focus_keys: Optional[List[str]] = None) -> 
 def coarse_to_fine_grid(
     spec: Dict[str, Any], run_batch: Callable[[List[Dict[str, Any]]], pd.DataFrame], top_k: int = 6
 ) -> pd.DataFrame:
-    """Zweistufige Grid Search: erst voll; falls >500 Kombis, auf coarse
-    reduzieren + top_k Regionen fine samplen."""
+    """Legacy auto-coarse-to-fine (triggert nur bei >500 Kombis). Bleibt fuer
+    Kompatibilitaet erhalten; neuer expliziter Modus: two_stage_ctf()."""
     full = build_grid(spec)
     if len(full) <= 500:
         return run_batch(full)
 
-    # Coarse: nimm nur jeden 2. Wert pro Key.
     coarse_spec = {}
     for k, v in spec.items():
         grid = list(v["grid"])
@@ -812,7 +811,6 @@ def coarse_to_fine_grid(
     coarse = build_grid(coarse_spec)
     coarse_res = run_batch(coarse)
 
-    # Top-K + lokale Verfeinerung.
     top = coarse_res.nlargest(top_k, "objective_score")
     fine_combos = []
     for _, row in top.iterrows():
@@ -829,7 +827,6 @@ def coarse_to_fine_grid(
             else:
                 local_spec[k] = v
         fine_combos.extend(build_grid(local_spec))
-    # dedupe
     seen = set()
     uniq = []
     for c in fine_combos:
@@ -839,6 +836,109 @@ def coarse_to_fine_grid(
             uniq.append(c)
     fine_res = run_batch(uniq)
     return pd.concat([coarse_res, fine_res], ignore_index=True).drop_duplicates()
+
+
+def _refine_numeric_grid(values: Sequence[Any], n_interp: int = 2) -> List[Any]:
+    """Verfeinere eine numerische Wertliste durch Einfuegen von n_interp
+    aequidistanten Punkten zwischen benachbarten Werten. Fuer Bool/Kategorial
+    unveraendert zurueckgeben."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return list(values)
+    if all(isinstance(v, bool) for v in vals):
+        return sorted(set(vals))
+    try:
+        nums = sorted(set(float(v) for v in vals))
+    except (TypeError, ValueError):
+        return sorted(set(vals), key=str)
+    if len(nums) < 2:
+        return nums
+    out: List[float] = []
+    for a, b in zip(nums[:-1], nums[1:]):
+        out.append(a)
+        step = (b - a) / (n_interp + 1)
+        for i in range(1, n_interp + 1):
+            out.append(a + step * i)
+    out.append(nums[-1])
+    # Runde Ints wieder zu Ints, wenn alle Eingabewerte int waren.
+    if all(isinstance(v, int) and not isinstance(v, bool) for v in vals):
+        out = sorted(set(int(round(x)) for x in out))
+    else:
+        out = sorted(set(round(x, 6) for x in out))
+    return out
+
+
+def two_stage_ctf(
+    spec: Dict[str, Any],
+    run_batch_coarse: Callable[[List[Dict[str, Any]]], pd.DataFrame],
+    run_batch_fine: Callable[[List[Dict[str, Any]]], pd.DataFrame],
+    top_frac: float = 0.10,
+    min_top: int = 4,
+    max_top: int = 40,
+    n_interp: int = 2,
+) -> pd.DataFrame:
+    """Expliziter Two-Stage-Coarse-to-Fine-Modus.
+
+    Stufe 1: volles Grid ueber `spec`, ausgewertet mit run_batch_coarse
+             (niedrige MC-Pfad-Anzahl -> schnelle Noise-Schaetzung).
+    Stufe 2: selektiere Top-`top_frac` der Stufe 1, baue PRO KEY die
+             Werte-Menge aus dieser Top-Region, verfeinere numerische Keys
+             durch `_refine_numeric_grid`, bilde das Cross-Product und
+             werte mit run_batch_fine (hoehere MC-Pfad-Anzahl) aus.
+
+    Rueckgabe: konkateniertes DataFrame mit Spalte `stage` in {"coarse","fine"}.
+    """
+    coarse_combos = build_grid(spec)
+    print(f"[CTF] Stage-1 coarse grid: {len(coarse_combos)} combos")
+    coarse_df = run_batch_coarse(coarse_combos)
+    if coarse_df.empty:
+        return coarse_df.assign(stage="coarse")
+    coarse_df = coarse_df.copy()
+    coarse_df["stage"] = "coarse"
+
+    n_top = int(max(min_top, min(max_top, math.ceil(len(coarse_df) * top_frac))))
+    top = coarse_df.nlargest(n_top, "objective_score")
+    print(f"[CTF] Stage-1 kept top {len(top)} rows (~{top_frac*100:.0f}%) for refinement")
+
+    # Baue fine_spec: pro Key nimm die in Top-Region vorkommenden Werte
+    # (plus optionale numerische Verfeinerung).
+    fine_spec: Dict[str, Any] = {}
+    for k, v in spec.items():
+        if k not in top.columns:
+            fine_spec[k] = v
+            continue
+        seen_vals = [x for x in top[k].tolist() if x is not None and not (isinstance(x, float) and math.isnan(x))]
+        if not seen_vals:
+            fine_spec[k] = v
+            continue
+        if v.get("type") in ("int", "float"):
+            fine_grid = _refine_numeric_grid(seen_vals, n_interp=n_interp)
+        else:
+            fine_grid = sorted(set(seen_vals), key=str)
+        fine_spec[k] = {"type": v["type"], "grid": fine_grid}
+
+    fine_combos = build_grid(fine_spec)
+    # Dedupe gegen bereits evaluierte coarse-Kombis (exakter Parameter-Match).
+    coarse_keys = set(
+        tuple(sorted((k, coarse_df.iloc[i][k]) for k in spec.keys() if k in coarse_df.columns))
+        for i in range(len(coarse_df))
+    )
+    fine_unique = []
+    for c in fine_combos:
+        key = tuple(sorted(c.items()))
+        if key not in coarse_keys:
+            fine_unique.append(c)
+    print(f"[CTF] Stage-2 fine grid: {len(fine_unique)} new combos (of {len(fine_combos)} generated)")
+
+    if not fine_unique:
+        return coarse_df
+
+    fine_df = run_batch_fine(fine_unique)
+    if fine_df is None or fine_df.empty:
+        return coarse_df
+    fine_df = fine_df.copy()
+    fine_df["stage"] = "fine"
+    return pd.concat([coarse_df, fine_df], ignore_index=True)
 
 
 # =============================================================================
@@ -1264,6 +1364,11 @@ def run_pipeline(
     eval_paths: int = 50,
     eval_paths_final: int = 200,
     skip_hist_in_grid: bool = True,
+    ctf_enabled: bool = False,
+    ctf_eval_coarse: int = 10,
+    ctf_eval_fine: int = 100,
+    ctf_top_frac: float = 0.10,
+    ctf_n_interp: int = 2,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -1369,66 +1474,81 @@ def run_pipeline(
 
     # -- Backtest-Runner (single param, over MC paths).
     T_path = min(arr.shape[1] for arr in mc_paths.values()) if mc_paths else 0
-    EVAL_PATHS = min(n_paths, max(1, eval_paths))  # Subsampling fuer Grid Search.
-    print(f"[INFO] Grid-Eval: {EVAL_PATHS} MC paths per combo, max_ticks={max_ticks}, skip_hist={skip_hist_in_grid}")
-
     hist_mids = {p: prices_df[prices_df["product"] == p]["mid_price"].values for p in products}
 
-    def run_backtest_for_params(params: Dict[str, Any]) -> Dict[str, float]:
-        # Historischer Lauf nur, wenn explizit gewuenscht (Grid kann ihn skippen).
-        if not skip_hist_in_grid:
-            hist_res = run_backtest_on_series(
-                trader_cls, params,
-                mids_by_product=hist_mids,
-                historical_depths=historical_depths if have_exact else None,
-                ordered_keys=ordered_keys if have_exact else None,
-                position_limits=position_limits,
-                max_ticks=max_ticks,
-            )
-        else:
-            hist_res = dict(final_pnl=0.0, max_drawdown=0.0, hit_rate=0.0,
-                            turnover=0.0, inventory_std=0.0, equity_curve=[0.0])
-        # MC-Pfad-Evaluation (APPROX auf synthetischen Orderbuechern).
-        profits = []
-        rng = np.random.default_rng(seed + hash(tuple(sorted(params.items()))) % 2**31)
-        idx = rng.choice(n_paths, size=EVAL_PATHS, replace=False)
-        for i in idx:
-            mids = {p: mc_paths[p][i] for p in products}
-            r = run_backtest_on_series(
-                trader_cls, params, mids_by_product=mids,
-                historical_depths=None, ordered_keys=None,
-                position_limits=position_limits,
-                max_ticks=max_ticks,
-            )
-            profits.append(r["final_pnl"])
-        profits = np.array(profits)
-        m = aggregate_path_metrics(profits, risk_lambda)
-        m.update(dict(
-            max_drawdown=hist_res["max_drawdown"],
-            hit_rate=hist_res["hit_rate"],
-            turnover=hist_res["turnover"],
-            inventory_std=hist_res["inventory_std"],
-            historical_final_pnl=hist_res["final_pnl"],
-        ))
-        return m
+    def _make_batch_runner(n_eval: int) -> Callable[[List[Dict[str, Any]]], pd.DataFrame]:
+        n_eval = max(1, min(n_paths, n_eval))
 
-    def run_batch(combos: List[Dict[str, Any]]) -> pd.DataFrame:
-        rows = []
-        for i, c in enumerate(combos):
-            try:
-                metrics = run_backtest_for_params(c)
-            except Exception as e:
-                print(f"[ERR] combo {i} failed: {e}")
-                continue
-            row = dict(c); row.update(metrics)
-            rows.append(row)
-            if (i + 1) % 25 == 0:
-                print(f"  [grid] {i + 1}/{len(combos)} evaluated")
-        return pd.DataFrame(rows)
+        def run_backtest_for_params(params: Dict[str, Any]) -> Dict[str, float]:
+            if not skip_hist_in_grid:
+                hist_res = run_backtest_on_series(
+                    trader_cls, params,
+                    mids_by_product=hist_mids,
+                    historical_depths=historical_depths if have_exact else None,
+                    ordered_keys=ordered_keys if have_exact else None,
+                    position_limits=position_limits,
+                    max_ticks=max_ticks,
+                )
+            else:
+                hist_res = dict(final_pnl=0.0, max_drawdown=0.0, hit_rate=0.0,
+                                turnover=0.0, inventory_std=0.0, equity_curve=[0.0])
+            profits: List[float] = []
+            rng = np.random.default_rng(seed + hash(tuple(sorted(params.items()))) % 2**31)
+            idx = rng.choice(n_paths, size=n_eval, replace=False)
+            for i in idx:
+                mids = {p: mc_paths[p][i] for p in products}
+                r = run_backtest_on_series(
+                    trader_cls, params, mids_by_product=mids,
+                    historical_depths=None, ordered_keys=None,
+                    position_limits=position_limits,
+                    max_ticks=max_ticks,
+                )
+                profits.append(r["final_pnl"])
+            profits_arr = np.array(profits)
+            m = aggregate_path_metrics(profits_arr, risk_lambda)
+            m.update(dict(
+                max_drawdown=hist_res["max_drawdown"],
+                hit_rate=hist_res["hit_rate"],
+                turnover=hist_res["turnover"],
+                inventory_std=hist_res["inventory_std"],
+                historical_final_pnl=hist_res["final_pnl"],
+                n_eval_paths=n_eval,
+            ))
+            return m
+
+        def run_batch(combos: List[Dict[str, Any]]) -> pd.DataFrame:
+            rows = []
+            for i, c in enumerate(combos):
+                try:
+                    metrics = run_backtest_for_params(c)
+                except Exception as e:
+                    print(f"[ERR] combo {i} failed: {e}")
+                    continue
+                row = dict(c); row.update(metrics)
+                rows.append(row)
+                if (i + 1) % 25 == 0:
+                    print(f"  [grid] {i + 1}/{len(combos)} evaluated (n_eval={n_eval})")
+            return pd.DataFrame(rows)
+
+        return run_batch
 
     # -- Grid Search.
-    print("[INFO] Running grid search ...")
-    full_results = coarse_to_fine_grid(spec, run_batch, top_k=6)
+    if ctf_enabled:
+        print(
+            f"[INFO] Running two-stage Coarse-to-Fine grid search: "
+            f"coarse_eval={ctf_eval_coarse}, fine_eval={ctf_eval_fine}, "
+            f"top_frac={ctf_top_frac}, n_interp={ctf_n_interp}"
+        )
+        run_batch_coarse = _make_batch_runner(ctf_eval_coarse)
+        run_batch_fine = _make_batch_runner(ctf_eval_fine)
+        full_results = two_stage_ctf(
+            spec, run_batch_coarse, run_batch_fine,
+            top_frac=ctf_top_frac, n_interp=ctf_n_interp,
+        )
+    else:
+        print(f"[INFO] Running single-stage grid search (eval_paths={eval_paths})")
+        run_batch = _make_batch_runner(eval_paths)
+        full_results = coarse_to_fine_grid(spec, run_batch, top_k=6)
     full_results.to_csv(out_dir / "full_grid_results.csv", index=False)
     print(f"[INFO] grid results: {len(full_results)} rows")
 
@@ -1537,6 +1657,16 @@ def parse_args() -> argparse.Namespace:
                     help="MC-Pfade fuer finale Best-Param-Auswertung und Fan-Chart.")
     ap.add_argument("--grid-with-hist", action="store_true",
                     help="Fuehre den historischen EXACT-Lauf bei JEDER Grid-Kombi aus (langsam).")
+    ap.add_argument("--ctf", action="store_true",
+                    help="Aktiviere Two-Stage Coarse-to-Fine Grid Search.")
+    ap.add_argument("--ctf-eval-coarse", type=int, default=10,
+                    help="MC-Pfade pro Kombi in der coarse Stage (Default 10).")
+    ap.add_argument("--ctf-eval-fine", type=int, default=100,
+                    help="MC-Pfade pro Kombi in der fine Stage (Default 100).")
+    ap.add_argument("--ctf-top-frac", type=float, default=0.10,
+                    help="Top-Anteil der coarse Stage fuer die Verfeinerung (Default 0.10).")
+    ap.add_argument("--ctf-n-interp", type=int, default=2,
+                    help="Zwischenpunkte zwischen numerischen Top-Werten in der fine Stage (Default 2).")
     return ap.parse_args()
 
 
@@ -1556,6 +1686,11 @@ if __name__ == "__main__":
             eval_paths=args.eval_paths,
             eval_paths_final=args.eval_paths_final,
             skip_hist_in_grid=(not args.grid_with_hist),
+            ctf_enabled=args.ctf,
+            ctf_eval_coarse=args.ctf_eval_coarse,
+            ctf_eval_fine=args.ctf_eval_fine,
+            ctf_top_frac=args.ctf_top_frac,
+            ctf_n_interp=args.ctf_n_interp,
         )
     except Exception as e:
         traceback.print_exc()
