@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+bt_out/
+bt_out_smoke/
+data/
+data_r1/
+*.csv
+!/examples/**/*.csv
+.venv/
+.env
