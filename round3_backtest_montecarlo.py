@@ -1117,6 +1117,7 @@ def run_backtest_on_series(
     realized_pnl_path: List[float] = []
     turnover = 0.0
     inventory_series: List[float] = []
+    n_fills = 0
     traderData = ""
 
     if historical_depths is not None and ordered_keys is not None and len(ordered_keys) > 1:
@@ -1168,6 +1169,7 @@ def run_backtest_on_series(
                 cash -= f.price * f.quantity  # buy reduces cash
                 turnover += abs(f.price * f.quantity)
                 position[f.product] += f.quantity
+            n_fills += len(fills)
             # Mark-to-market at the current mid.
             mtm = 0.0
             for p, pos in position.items():
@@ -1237,6 +1239,7 @@ def run_backtest_on_series(
                 cash -= f.price * f.quantity
                 turnover += abs(f.price * f.quantity)
                 position[f.product] += f.quantity
+            n_fills += len(fills)
             mtm = sum(position.get(p, 0) * float(clean[p][t]) for p in products)
             realized_pnl_path.append(cash + mtm)
             inventory_series.append(sum(abs(v) for v in position.values()))
@@ -1253,6 +1256,7 @@ def run_backtest_on_series(
         hit_rate=float((returns > 0).mean()) if len(returns) else 0.0,
         turnover=float(turnover),
         inventory_std=float(np.std(inventory_series)) if inventory_series else 0.0,
+        n_trades=int(n_fills),
         equity_curve=pnl.tolist(),
     )
 
@@ -1263,8 +1267,30 @@ def run_backtest_on_series(
 
 
 def aggregate_path_metrics(
-    per_path_profits: np.ndarray, risk_lambda: float
+    per_path_profits: np.ndarray,
+    risk_lambda: float,
+    per_path_trades: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
+    """Aggregate metrics across Monte-Carlo paths for a single parameter combo.
+
+    In addition to the standard profit/risk statistics, two
+    consistency-oriented metrics are reported:
+
+    * ``sharpe`` -- cross-path Sharpe ratio, ``mean_profit / profit_std``.
+      This measures how reliable the PnL is across MC scenarios. It is
+      *not* annualised (Prosperity's tick grid has no calendar reference),
+      so interpret it as a ratio in profit units, directly comparable
+      across combos.
+    * ``profit_per_trade`` -- average profit per executed fill
+      (``mean_profit / mean_trades_per_path``). A proxy for edge per
+      round-trip; higher = more PnL earned per order filled, which
+      rewards selective strategies over churn-heavy ones.
+
+    ``objective_score`` stays the risk-adjusted mean
+    ``mean - risk_lambda * variance`` to preserve backwards-compatible
+    ranking; the new metrics are additive so the fine stage can sort
+    on them explicitly.
+    """
     if len(per_path_profits) == 0:
         return {}
     mean_p = float(np.mean(per_path_profits))
@@ -1274,6 +1300,18 @@ def aggregate_path_metrics(
     var_5 = float(np.quantile(per_path_profits, 0.05))
     cvar_5 = float(per_path_profits[per_path_profits <= var_5].mean()) if np.any(per_path_profits <= var_5) else var_5
     worst = float(per_path_profits.min())
+
+    # Cross-path Sharpe: mean / std. Not annualised (tick grid != time).
+    sharpe = mean_p / (std_p + 1e-9)
+
+    # Profit per trade (per executed fill).
+    if per_path_trades is not None and len(per_path_trades) > 0:
+        mean_trades = float(np.mean(per_path_trades))
+        median_trades = float(np.median(per_path_trades))
+    else:
+        mean_trades = 0.0
+        median_trades = 0.0
+    profit_per_trade = (mean_p / mean_trades) if mean_trades > 0 else 0.0
 
     # Normalization (keep the score comparable across grid combinations).
     norm_mean = mean_p
@@ -1289,6 +1327,10 @@ def aggregate_path_metrics(
         CVaR_5=cvar_5,
         worst_path_profit=worst,
         objective_score=score,
+        sharpe=sharpe,
+        profit_per_trade=profit_per_trade,
+        mean_trades_per_path=mean_trades,
+        median_trades_per_path=median_trades,
     )
 
 
@@ -1328,6 +1370,8 @@ def pick_top2_robust(full_results: pd.DataFrame) -> pd.DataFrame:
             "objective_score", "obj_norm", "total_profit", "mean_profit", "median_profit",
             "profit_std", "variance", "VaR_5", "CVaR_5", "worst_path_profit", "max_drawdown",
             "hit_rate", "turnover", "inventory_std",
+            "sharpe", "profit_per_trade", "mean_trades_per_path", "median_trades_per_path",
+            "n_trades", "historical_final_pnl", "n_eval_paths",
         } and pd.api.types.is_numeric_dtype(df[c])
     ]
     if num_cols:
@@ -1629,6 +1673,7 @@ def run_pipeline(
                 hist_res = dict(final_pnl=0.0, max_drawdown=0.0, hit_rate=0.0,
                                 turnover=0.0, inventory_std=0.0, equity_curve=[0.0])
             profits: List[float] = []
+            trade_counts: List[int] = []
             rng = np.random.default_rng(seed + hash(tuple(sorted(params.items()))) % 2**31)
             idx = rng.choice(n_paths, size=n_eval, replace=False)
             for i in idx:
@@ -1640,8 +1685,10 @@ def run_pipeline(
                     max_ticks=max_ticks,
                 )
                 profits.append(r["final_pnl"])
+                trade_counts.append(r["n_trades"])
             profits_arr = np.array(profits)
-            m = aggregate_path_metrics(profits_arr, risk_lambda)
+            trades_arr = np.array(trade_counts)
+            m = aggregate_path_metrics(profits_arr, risk_lambda, per_path_trades=trades_arr)
             m.update(dict(
                 max_drawdown=hist_res["max_drawdown"],
                 hit_rate=hist_res["hit_rate"],
