@@ -866,6 +866,7 @@ def run_backtest_on_series(
     historical_depths: Optional[Dict[Tuple[int, int], Dict[str, OrderDepth]]],
     ordered_keys: Optional[List[Tuple[int, int]]],
     position_limits: Dict[str, int],
+    max_ticks: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Führt einen Backtest aus.
     Wenn historical_depths + ordered_keys gegeben: EXACT-Modus (nutzt echte Orderbücher).
@@ -904,6 +905,8 @@ def run_backtest_on_series(
     if historical_depths is not None and ordered_keys is not None and len(ordered_keys) > 1:
         FILL_MODE = "EXACT"
         keys = ordered_keys
+        if max_ticks is not None and max_ticks > 0 and len(keys) > max_ticks:
+            keys = keys[:max_ticks]
         # Precompute next-mid cache.
         all_prods = set()
         for _, d in historical_depths.items():
@@ -971,9 +974,11 @@ def run_backtest_on_series(
                 idx = np.where(~mask, np.arange(len(arr)), 0)
                 np.maximum.accumulate(idx, out=idx)
                 arr = arr[idx]
-            clean[p] = arr
+                clean[p] = arr
         products = list(clean.keys())
         T = min(len(clean[p]) for p in products) if products else 0
+        if max_ticks is not None and max_ticks > 0:
+            T = min(T, max_ticks)
         for t in range(T):
             depths: Dict[str, OrderDepth] = {}
             for p in products:
@@ -1229,6 +1234,23 @@ def plot_stability(top_k_path_profits: List[np.ndarray], labels: List[str], out:
 # =============================================================================
 
 
+def _single_day_keys(
+    ordered_keys: List[Tuple[int, int]], exact_days: int
+) -> List[Tuple[int, int]]:
+    """Begrenze EXACT-Modus auf die ersten exact_days Tage (deterministisch)."""
+    if not ordered_keys or exact_days <= 0:
+        return []
+    days_seen: List[int] = []
+    picked: List[Tuple[int, int]] = []
+    for k in ordered_keys:
+        if k[0] not in days_seen:
+            if len(days_seen) >= exact_days:
+                break
+            days_seen.append(k[0])
+        picked.append(k)
+    return picked
+
+
 def run_pipeline(
     data_dir: Path,
     out_dir: Path,
@@ -1237,6 +1259,11 @@ def run_pipeline(
     seed: int,
     risk_lambda: float,
     round_filter: Optional[int] = None,
+    max_ticks: Optional[int] = None,
+    exact_days: int = 1,
+    eval_paths: int = 50,
+    eval_paths_final: int = 200,
+    skip_hist_in_grid: bool = True,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -1297,12 +1324,19 @@ def run_pipeline(
 
     # -- Historical depths (EXACT falls moeglich).
     historical_depths = prices_to_order_depths(prices_df)
-    ordered_keys = sorted(historical_depths.keys())
-    have_exact = len(historical_depths) > 0 and any(
-        any(d.buy_orders or d.sell_orders for d in m.values())
-        for m in historical_depths.values()
+    ordered_keys_all = sorted(historical_depths.keys())
+    # Default: EXACT-Modus auf exact_days Tage begrenzen (deutlich schneller).
+    ordered_keys = _single_day_keys(ordered_keys_all, exact_days)
+    if max_ticks is not None and max_ticks > 0 and len(ordered_keys) > max_ticks:
+        ordered_keys = ordered_keys[:max_ticks]
+    have_exact = len(ordered_keys) > 1 and any(
+        any(d.buy_orders or d.sell_orders for d in historical_depths.get(k, {}).values())
+        for k in ordered_keys
     )
-    print(f"[INFO] EXACT-fill data available: {have_exact}")
+    print(
+        f"[INFO] EXACT-fill: available={have_exact} keys={len(ordered_keys)} "
+        f"(of {len(ordered_keys_all)}) exact_days={exact_days} max_ticks={max_ticks}"
+    )
 
     # -- Trader.
     trader_cls = load_external_trader(trader_path) if trader_path else None
@@ -1316,9 +1350,11 @@ def run_pipeline(
     spec = extract_param_spec(trader_cls)
     print(f"[INFO] Parameter registry keys: {list(spec.keys())}")
 
-    # -- Monte-Carlo paths.
+    # -- Monte-Carlo paths (truncated to max_ticks if set).
     print(f"[INFO] Generating {n_paths} Monte-Carlo paths ...")
     mc_paths = generate_monte_carlo_paths(prices_df, n_paths=n_paths, seed=seed)
+    if max_ticks is not None and max_ticks > 0:
+        mc_paths = {p: arr[:, :max_ticks] for p, arr in mc_paths.items()}
     products = list(mc_paths.keys())
     mc_summary_rows = []
     for p, arr in mc_paths.items():
@@ -1333,17 +1369,25 @@ def run_pipeline(
 
     # -- Backtest-Runner (single param, over MC paths).
     T_path = min(arr.shape[1] for arr in mc_paths.values()) if mc_paths else 0
-    EVAL_PATHS = min(n_paths, 200)  # Subsampling fuer Grid Search (Speed).
+    EVAL_PATHS = min(n_paths, max(1, eval_paths))  # Subsampling fuer Grid Search.
+    print(f"[INFO] Grid-Eval: {EVAL_PATHS} MC paths per combo, max_ticks={max_ticks}, skip_hist={skip_hist_in_grid}")
+
+    hist_mids = {p: prices_df[prices_df["product"] == p]["mid_price"].values for p in products}
 
     def run_backtest_for_params(params: Dict[str, Any]) -> Dict[str, float]:
-        # Historischer Lauf (EXACT wenn moeglich).
-        hist_res = run_backtest_on_series(
-            trader_cls, params,
-            mids_by_product={p: prices_df[prices_df["product"] == p]["mid_price"].values for p in products},
-            historical_depths=historical_depths if have_exact else None,
-            ordered_keys=ordered_keys if have_exact else None,
-            position_limits=position_limits,
-        )
+        # Historischer Lauf nur, wenn explizit gewuenscht (Grid kann ihn skippen).
+        if not skip_hist_in_grid:
+            hist_res = run_backtest_on_series(
+                trader_cls, params,
+                mids_by_product=hist_mids,
+                historical_depths=historical_depths if have_exact else None,
+                ordered_keys=ordered_keys if have_exact else None,
+                position_limits=position_limits,
+                max_ticks=max_ticks,
+            )
+        else:
+            hist_res = dict(final_pnl=0.0, max_drawdown=0.0, hit_rate=0.0,
+                            turnover=0.0, inventory_std=0.0, equity_curve=[0.0])
         # MC-Pfad-Evaluation (APPROX auf synthetischen Orderbuechern).
         profits = []
         rng = np.random.default_rng(seed + hash(tuple(sorted(params.items()))) % 2**31)
@@ -1354,6 +1398,7 @@ def run_pipeline(
                 trader_cls, params, mids_by_product=mids,
                 historical_depths=None, ordered_keys=None,
                 position_limits=position_limits,
+                max_ticks=max_ticks,
             )
             profits.append(r["final_pnl"])
         profits = np.array(profits)
@@ -1398,28 +1443,30 @@ def run_pipeline(
     print(top2.to_string(index=False))
 
     # -- Visualisierung.
-    # Best-Param historische Equity.
+    # Best-Param historische Equity (einmaliger EXACT-Lauf, kein Grid-Overhead).
     if not top2.empty:
         best = top2.iloc[0].to_dict()
         best_params = {k: best[k] for k in spec.keys() if k in best}
         hist_res = run_backtest_on_series(
             trader_cls, best_params,
-            mids_by_product={p: prices_df[prices_df["product"] == p]["mid_price"].values for p in products},
+            mids_by_product=hist_mids,
             historical_depths=historical_depths if have_exact else None,
             ordered_keys=ordered_keys if have_exact else None,
             position_limits=position_limits,
+            max_ticks=max_ticks,
         )
         plot_equity_curve(hist_res["equity_curve"], out_dir / "plot_equity_curve.png")
 
         # Fan chart + final pnl dist fuer best params.
         path_curves = []
         finals = []
-        for i in range(min(200, n_paths)):
+        for i in range(min(eval_paths_final, n_paths)):
             mids = {p: mc_paths[p][i] for p in products}
             r = run_backtest_on_series(
                 trader_cls, best_params, mids_by_product=mids,
                 historical_depths=None, ordered_keys=None,
                 position_limits=position_limits,
+                max_ticks=max_ticks,
             )
             path_curves.append(r["equity_curve"])
             finals.append(r["final_pnl"])
@@ -1448,15 +1495,17 @@ def run_pipeline(
     top_k = full_results.nlargest(5, "objective_score")
     per_path_list = []
     labels = []
+    stab_n = min(eval_paths_final // 2 if eval_paths_final >= 20 else 20, n_paths)
     for _, r in top_k.iterrows():
         params = {k: r[k] for k in spec.keys() if k in r}
         profits = []
-        for i in range(min(100, n_paths)):
+        for i in range(stab_n):
             mids = {p: mc_paths[p][i] for p in products}
             rr = run_backtest_on_series(
                 trader_cls, params, mids_by_product=mids,
                 historical_depths=None, ordered_keys=None,
                 position_limits=position_limits,
+                max_ticks=max_ticks,
             )
             profits.append(rr["final_pnl"])
         per_path_list.append(np.array(profits))
@@ -1478,6 +1527,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--risk-lambda", type=float, default=0.5,
                     help="Risk-Gewichtung in objective_score = mean - lambda*var")
+    ap.add_argument("--max-ticks", type=int, default=2000,
+                    help="Begrenze Ticks pro Backtest-Lauf (0 = kein Limit).")
+    ap.add_argument("--exact-days", type=int, default=1,
+                    help="Anzahl Tage, die im EXACT-Modus verwendet werden (0 = kein EXACT).")
+    ap.add_argument("--eval-paths", type=int, default=50,
+                    help="MC-Pfade pro Grid-Kombination (Speed/Varianz-Tradeoff).")
+    ap.add_argument("--eval-paths-final", type=int, default=200,
+                    help="MC-Pfade fuer finale Best-Param-Auswertung und Fan-Chart.")
+    ap.add_argument("--grid-with-hist", action="store_true",
+                    help="Fuehre den historischen EXACT-Lauf bei JEDER Grid-Kombi aus (langsam).")
     return ap.parse_args()
 
 
@@ -1492,6 +1551,11 @@ if __name__ == "__main__":
             seed=args.seed,
             risk_lambda=args.risk_lambda,
             round_filter=args.round_filter,
+            max_ticks=(args.max_ticks if args.max_ticks and args.max_ticks > 0 else None),
+            exact_days=args.exact_days,
+            eval_paths=args.eval_paths,
+            eval_paths_final=args.eval_paths_final,
+            skip_hist_in_grid=(not args.grid_with_hist),
         )
     except Exception as e:
         traceback.print_exc()
