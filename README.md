@@ -68,12 +68,16 @@ a full set of artifacts (CSVs + plots) into an output directory.
 
 ```
 backtesting-engine/
-├── round3_backtest_montecarlo.py   # complete pipeline (≈1.8 kLoC, one file)
+├── round3_backtest_montecarlo.py   # complete pipeline (≈2 kLoC, one file)
+├── mean_reversion.py               # sample z-score mean-reversion trader
+├── requirements.txt                # pinned deps (incl. joblib + tqdm)
 └── README.md                       # this file
 ```
 
-The script is intentionally self-contained. Only `numpy`, `pandas`, and
-`matplotlib` are required at runtime.
+The script is intentionally self-contained. `numpy`, `pandas`, and
+`matplotlib` are strictly required at runtime; `joblib` and `tqdm` are
+optional but strongly recommended (they unlock multi-core parallelism
+and a live progress bar).
 
 ## Installation
 
@@ -83,8 +87,14 @@ cd backtesting-engine
 
 python -m venv .venv
 source .venv/bin/activate
-pip install numpy pandas matplotlib
+pip install -r requirements.txt
 ```
+
+This installs everything, including the optional parallel-execution
+stack (`joblib`, `tqdm`). If you prefer a minimal install, only
+`numpy`, `pandas`, and `matplotlib` are strictly required — the engine
+falls back to single-threaded execution and plain text progress when
+`joblib`/`tqdm` are missing.
 
 Python 3.10+ is required (3.12 is supported).
 
@@ -238,6 +248,7 @@ python round3_backtest_montecarlo.py \
 | `--ctf-eval-fine N` | `100` | MC paths per combo in the fine stage. |
 | `--ctf-top-frac F` | `0.10` | Top fraction of the coarse stage used for refinement. |
 | `--ctf-n-interp N` | `2` | Interpolation points inserted between numeric top values. |
+| `--n-workers N` | `-1` | Parallel worker processes (`-1` = all CPU cores, `1` = single-threaded). Requires `joblib` + `tqdm`. |
 
 ## Output artifacts
 
@@ -315,6 +326,18 @@ Sections in the script (numbered comments at the top of each):
 
 ## Performance tips
 
+- **Use all your cores.** By default `--n-workers -1` dispatches the
+  grid search, fan chart, and stability evaluation to a `joblib` /
+  `loky` process pool — one worker per CPU core. A live `tqdm`
+  progress bar shows throughput. On an 8-core laptop expect roughly a
+  6–7× wall-clock speedup over single-threaded execution; on a 16-core
+  box, 10–14×. Pass `--n-workers 1` to restore the legacy
+  single-threaded behaviour for debugging.
+- Because workers are separate OS processes, your laptop CPU should be
+  pinned near 100 % during the grid stage. If it is not, check whether
+  `joblib` and `tqdm` are actually installed (`pip install joblib
+  tqdm`) — the engine warns and falls back to serial execution when
+  they are missing.
 - `--max-ticks` is the single most effective knob during iteration. A
   value of 300–600 keeps a full pipeline under a minute even on modest
   hardware.

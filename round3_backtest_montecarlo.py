@@ -74,6 +74,26 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
+# Optional parallel-execution dependencies. The engine stays fully usable
+# without them (single-threaded fallback) but `pip install joblib tqdm`
+# unlocks process-pool parallelism with a live progress bar.
+try:
+    from joblib import Parallel, delayed
+    _HAS_JOBLIB = True
+except ImportError:
+    _HAS_JOBLIB = False
+    Parallel = None  # type: ignore
+    delayed = None  # type: ignore
+
+try:
+    from tqdm.auto import tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
+    def tqdm(iterable, **kwargs):  # type: ignore
+        return iterable
+
 
 # =============================================================================
 # 0. GLOBAL CONFIG / ASSUMPTIONS
@@ -1334,6 +1354,193 @@ def aggregate_path_metrics(
     )
 
 
+# -----------------------------------------------------------------------------
+# Parallel-execution helpers. The per-combo worker must be defined at module
+# level so it is picklable by loky / multiprocessing. Each worker process keeps
+# a local cache of loaded trader classes to avoid re-importing the trader file
+# on every task.
+# -----------------------------------------------------------------------------
+
+_WORKER_TRADER_CACHE: Dict[str, Any] = {}
+
+
+def _worker_get_trader_cls(trader_path_str: Optional[str]):
+    """Return (and cache) the Trader class for a given file path inside a
+    worker process. Falls back to :class:`DefaultMarketMaker` on any failure.
+    """
+    if not trader_path_str:
+        return DefaultMarketMaker
+    cached = _WORKER_TRADER_CACHE.get(trader_path_str)
+    if cached is not None:
+        return cached
+    cls = load_external_trader(Path(trader_path_str)) or DefaultMarketMaker
+    _WORKER_TRADER_CACHE[trader_path_str] = cls
+    return cls
+
+
+def _eval_combo_worker(
+    trader_path_str: Optional[str],
+    params: Dict[str, Any],
+    mc_paths: Dict[str, np.ndarray],
+    hist_mids: Optional[Dict[str, np.ndarray]],
+    historical_depths: Optional[Dict],
+    ordered_keys: Optional[List],
+    position_limits: Dict[str, int],
+    max_ticks: Optional[int],
+    market_trades_index: Optional[Dict],
+    n_eval: int,
+    n_paths: int,
+    skip_hist_in_grid: bool,
+    risk_lambda: float,
+    have_exact: bool,
+    seed: int,
+) -> Optional[Dict[str, Any]]:
+    """Evaluate ONE parameter combination across ``n_eval`` Monte-Carlo paths
+    (and optionally one historical EXACT backtest). Designed to run inside a
+    ``joblib`` worker process -- all inputs must be picklable.
+
+    Returns a flat metrics dict (params merged with aggregated stats) or
+    ``None`` if the run raised internally.
+    """
+    try:
+        trader_cls = _worker_get_trader_cls(trader_path_str)
+
+        # Optional historical backtest (disabled by default for grid runs).
+        if not skip_hist_in_grid and hist_mids is not None:
+            hist_res = run_backtest_on_series(
+                trader_cls, params,
+                mids_by_product=hist_mids,
+                historical_depths=historical_depths if have_exact else None,
+                ordered_keys=ordered_keys if have_exact else None,
+                position_limits=position_limits,
+                max_ticks=max_ticks,
+                market_trades_index=market_trades_index if have_exact else None,
+            )
+        else:
+            hist_res = dict(final_pnl=0.0, max_drawdown=0.0, hit_rate=0.0,
+                            turnover=0.0, inventory_std=0.0, equity_curve=[0.0])
+
+        products = list(mc_paths.keys())
+        profits: List[float] = []
+        trade_counts: List[int] = []
+        rng = np.random.default_rng(seed + hash(tuple(sorted(params.items()))) % 2**31)
+        n_eval_eff = max(1, min(n_paths, n_eval))
+        idx = rng.choice(n_paths, size=n_eval_eff, replace=False)
+        for i in idx:
+            mids = {p: mc_paths[p][i] for p in products}
+            r = run_backtest_on_series(
+                trader_cls, params, mids_by_product=mids,
+                historical_depths=None, ordered_keys=None,
+                position_limits=position_limits,
+                max_ticks=max_ticks,
+            )
+            profits.append(r["final_pnl"])
+            trade_counts.append(r["n_trades"])
+
+        profits_arr = np.array(profits)
+        trades_arr = np.array(trade_counts)
+        m = aggregate_path_metrics(profits_arr, risk_lambda, per_path_trades=trades_arr)
+        m.update(dict(
+            max_drawdown=hist_res["max_drawdown"],
+            hit_rate=hist_res["hit_rate"],
+            turnover=hist_res["turnover"],
+            inventory_std=hist_res["inventory_std"],
+            historical_final_pnl=hist_res["final_pnl"],
+            n_eval_paths=n_eval_eff,
+        ))
+        row = dict(params)
+        row.update(m)
+        return row
+    except Exception as e:
+        print(f"[ERR] combo {params} failed in worker: {e}")
+        return None
+
+
+def _eval_single_path_worker(
+    trader_path_str: Optional[str],
+    params: Dict[str, Any],
+    mc_paths: Dict[str, np.ndarray],
+    path_idx: int,
+    position_limits: Dict[str, int],
+    max_ticks: Optional[int],
+) -> Dict[str, Any]:
+    """Evaluate ONE MC path for a fixed parameter combo. Used by the fan-chart
+    and stability visualization stages so they also benefit from parallelism.
+    """
+    trader_cls = _worker_get_trader_cls(trader_path_str)
+    products = list(mc_paths.keys())
+    mids = {p: mc_paths[p][path_idx] for p in products}
+    r = run_backtest_on_series(
+        trader_cls, params, mids_by_product=mids,
+        historical_depths=None, ordered_keys=None,
+        position_limits=position_limits,
+        max_ticks=max_ticks,
+    )
+    return {"final_pnl": r["final_pnl"], "equity_curve": r["equity_curve"]}
+
+
+def _parallel_map(
+    jobs: List[Any],
+    worker_fn: Callable,
+    n_workers: int,
+    desc: str = "grid",
+    show_progress: bool = True,
+) -> List[Any]:
+    """Dispatch a list of delayed jobs across ``n_workers`` processes using
+    joblib (``loky`` backend). Falls back to a plain serial loop when joblib
+    is not installed or ``n_workers == 1``.
+
+    ``n_workers``:
+        * ``-1`` -- use all available CPU cores (default).
+        * ``0``  -- treated like ``-1`` for user convenience.
+        * ``1``  -- serial execution (legacy behaviour).
+        * ``>=2`` -- explicit worker count.
+    """
+    if n_workers == 0:
+        n_workers = -1
+    total = len(jobs)
+    if total == 0:
+        return []
+    if not _HAS_JOBLIB or n_workers == 1:
+        iterator = tqdm(jobs, desc=desc, total=total) if show_progress else jobs
+        return [worker_fn(*args) for args in iterator]
+    n_actual = os.cpu_count() or 1 if n_workers < 0 else min(n_workers, len(jobs))
+    print(f"[PAR] {desc}: dispatching {total} jobs to {n_actual} workers (joblib/loky)")
+    if show_progress and _HAS_TQDM:
+        # Joblib has no native tqdm hook; we use a lightweight wrapper that
+        # advances the bar as futures complete.
+        with tqdm(total=total, desc=desc) as pbar:
+            results: List[Any] = [None] * total
+
+            def _wrapped(idx, args):
+                r = worker_fn(*args)
+                return idx, r
+
+            # return_as="generator" streams results as they finish -> live bar.
+            try:
+                gen = Parallel(n_jobs=n_workers, backend="loky", return_as="generator")(
+                    delayed(_wrapped)(i, args) for i, args in enumerate(jobs)
+                )
+                for idx, r in gen:
+                    results[idx] = r
+                    pbar.update(1)
+                return results
+            except TypeError:
+                # Older joblib without ``return_as="generator"`` -- fall back
+                # to a blocking call without live progress updates.
+                out = Parallel(n_jobs=n_workers, backend="loky")(
+                    delayed(worker_fn)(*args) for args in jobs
+                )
+                pbar.update(total)
+                return list(out)
+    else:
+        return list(
+            Parallel(n_jobs=n_workers, backend="loky")(
+                delayed(worker_fn)(*args) for args in jobs
+            )
+        )
+
+
 def pareto_frontier(df: pd.DataFrame, x_col: str, y_col: str, maximize_y: bool = True) -> pd.DataFrame:
     """Pareto frontier: we want mean_profit MAX and variance MIN.
     Here x=variance (min), y=mean_profit (max)."""
@@ -1534,9 +1741,20 @@ def run_pipeline(
     ctf_eval_fine: int = 100,
     ctf_top_frac: float = 0.10,
     ctf_n_interp: int = 2,
+    n_workers: int = -1,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+
+    # -- Parallel-execution banner.
+    if _HAS_JOBLIB and n_workers != 1:
+        eff = (os.cpu_count() or 1) if n_workers < 1 else n_workers
+        print(f"[INFO] parallel mode: joblib/loky, n_workers={n_workers} (effective ~{eff})")
+    else:
+        if not _HAS_JOBLIB and n_workers != 1:
+            print("[WARN] joblib not installed -- falling back to single-threaded execution. "
+                  "Install with: pip install joblib tqdm")
+        print("[INFO] parallel mode: off (single-threaded)")
 
     # -- Discover & load.
     files = discover_files(data_dir, round_filter=round_filter)
@@ -1655,62 +1873,43 @@ def run_pipeline(
     T_path = min(arr.shape[1] for arr in mc_paths.values()) if mc_paths else 0
     hist_mids = {p: prices_df[prices_df["product"] == p]["mid_price"].values for p in products}
 
+    # Trader path string -- passed to workers (path object is picklable but
+    # the Trader class itself may not be; workers re-import by path).
+    trader_path_str = str(trader_path) if trader_path else None
+
     def _make_batch_runner(n_eval: int) -> Callable[[List[Dict[str, Any]]], pd.DataFrame]:
         n_eval = max(1, min(n_paths, n_eval))
 
-        def run_backtest_for_params(params: Dict[str, Any]) -> Dict[str, float]:
-            if not skip_hist_in_grid:
-                hist_res = run_backtest_on_series(
-                    trader_cls, params,
-                    mids_by_product=hist_mids,
-                    historical_depths=historical_depths if have_exact else None,
-                    ordered_keys=ordered_keys if have_exact else None,
-                    position_limits=position_limits,
-                    max_ticks=max_ticks,
-                    market_trades_index=market_trades_index if have_exact else None,
-                )
-            else:
-                hist_res = dict(final_pnl=0.0, max_drawdown=0.0, hit_rate=0.0,
-                                turnover=0.0, inventory_std=0.0, equity_curve=[0.0])
-            profits: List[float] = []
-            trade_counts: List[int] = []
-            rng = np.random.default_rng(seed + hash(tuple(sorted(params.items()))) % 2**31)
-            idx = rng.choice(n_paths, size=n_eval, replace=False)
-            for i in idx:
-                mids = {p: mc_paths[p][i] for p in products}
-                r = run_backtest_on_series(
-                    trader_cls, params, mids_by_product=mids,
-                    historical_depths=None, ordered_keys=None,
-                    position_limits=position_limits,
-                    max_ticks=max_ticks,
-                )
-                profits.append(r["final_pnl"])
-                trade_counts.append(r["n_trades"])
-            profits_arr = np.array(profits)
-            trades_arr = np.array(trade_counts)
-            m = aggregate_path_metrics(profits_arr, risk_lambda, per_path_trades=trades_arr)
-            m.update(dict(
-                max_drawdown=hist_res["max_drawdown"],
-                hit_rate=hist_res["hit_rate"],
-                turnover=hist_res["turnover"],
-                inventory_std=hist_res["inventory_std"],
-                historical_final_pnl=hist_res["final_pnl"],
-                n_eval_paths=n_eval,
-            ))
-            return m
-
         def run_batch(combos: List[Dict[str, Any]]) -> pd.DataFrame:
-            rows = []
-            for i, c in enumerate(combos):
-                try:
-                    metrics = run_backtest_for_params(c)
-                except Exception as e:
-                    print(f"[ERR] combo {i} failed: {e}")
-                    continue
-                row = dict(c); row.update(metrics)
-                rows.append(row)
-                if (i + 1) % 25 == 0:
-                    print(f"  [grid] {i + 1}/{len(combos)} evaluated (n_eval={n_eval})")
+            # Build the argument tuples for every combo -- all inputs are
+            # already picklable (dicts of numpy arrays + primitives).
+            jobs = [
+                (
+                    trader_path_str,
+                    c,
+                    mc_paths,
+                    hist_mids if not skip_hist_in_grid else None,
+                    historical_depths if not skip_hist_in_grid else None,
+                    ordered_keys if not skip_hist_in_grid else None,
+                    position_limits,
+                    max_ticks,
+                    market_trades_index if not skip_hist_in_grid else None,
+                    n_eval,
+                    n_paths,
+                    skip_hist_in_grid,
+                    risk_lambda,
+                    have_exact,
+                    seed,
+                )
+                for c in combos
+            ]
+            results = _parallel_map(
+                jobs,
+                _eval_combo_worker,
+                n_workers=n_workers,
+                desc=f"grid (n_eval={n_eval})",
+            )
+            rows = [r for r in results if r is not None]
             return pd.DataFrame(rows)
 
         return run_batch
@@ -1761,20 +1960,17 @@ def run_pipeline(
         )
         plot_equity_curve(hist_res["equity_curve"], out_dir / "plot_equity_curve.png")
 
-        # Fan chart + final PnL distribution for the best params.
-        path_curves = []
-        finals = []
-        for i in range(min(eval_paths_final, n_paths)):
-            mids = {p: mc_paths[p][i] for p in products}
-            r = run_backtest_on_series(
-                trader_cls, best_params, mids_by_product=mids,
-                historical_depths=None, ordered_keys=None,
-                position_limits=position_limits,
-                max_ticks=max_ticks,
-            )
-            path_curves.append(r["equity_curve"])
-            finals.append(r["final_pnl"])
-        minlen = min(len(c) for c in path_curves)
+        # Fan chart + final PnL distribution for the best params (parallel).
+        fan_jobs = [
+            (trader_path_str, best_params, mc_paths, i, position_limits, max_ticks)
+            for i in range(min(eval_paths_final, n_paths))
+        ]
+        fan_results = _parallel_map(
+            fan_jobs, _eval_single_path_worker, n_workers=n_workers, desc="fan-chart",
+        )
+        path_curves = [r["equity_curve"] for r in fan_results if r is not None]
+        finals = [r["final_pnl"] for r in fan_results if r is not None]
+        minlen = min(len(c) for c in path_curves) if path_curves else 0
         eq_matrix = np.array([c[:minlen] for c in path_curves])
         plot_fan_chart(eq_matrix, out_dir / "plot_mc_fan_chart.png")
         plot_final_pnl_dist(np.array(finals), out_dir / "plot_final_pnl_dist.png")
@@ -1795,25 +1991,27 @@ def run_pipeline(
         k1, k2 = variances[0][0], variances[1][0]
         plot_heatmap_top2(full_results, (k1, k2), out_dir / f"plot_heatmap_{k1}_vs_{k2}.png")
 
-    # Stability box plot for top-K.
+    # Stability box plot for top-K (parallel across combos x paths).
     top_k = full_results.nlargest(5, "objective_score")
-    per_path_list = []
-    labels = []
     stab_n = min(eval_paths_final // 2 if eval_paths_final >= 20 else 20, n_paths)
-    for _, r in top_k.iterrows():
-        params = {k: r[k] for k in spec.keys() if k in r}
-        profits = []
-        for i in range(stab_n):
-            mids = {p: mc_paths[p][i] for p in products}
-            rr = run_backtest_on_series(
-                trader_cls, params, mids_by_product=mids,
-                historical_depths=None, ordered_keys=None,
-                position_limits=position_limits,
-                max_ticks=max_ticks,
-            )
-            profits.append(rr["final_pnl"])
-        per_path_list.append(np.array(profits))
-        labels.append("|".join(f"{k}={params[k]}" for k in list(params)[:2]))
+    stab_param_rows = [
+        {k: r[k] for k in spec.keys() if k in r} for _, r in top_k.iterrows()
+    ]
+    labels = [
+        "|".join(f"{k}={p[k]}" for k in list(p)[:2]) for p in stab_param_rows
+    ]
+    stab_jobs = [
+        (trader_path_str, p, mc_paths, i, position_limits, max_ticks)
+        for p in stab_param_rows for i in range(stab_n)
+    ]
+    stab_results = _parallel_map(
+        stab_jobs, _eval_single_path_worker, n_workers=n_workers, desc="stability",
+    )
+    per_path_list = []
+    for ci in range(len(stab_param_rows)):
+        chunk = stab_results[ci * stab_n:(ci + 1) * stab_n]
+        profits = np.array([r["final_pnl"] for r in chunk if r is not None])
+        per_path_list.append(profits)
     plot_stability(per_path_list, labels, out_dir / "plot_stability_topK.png")
 
     print(f"[INFO] DONE in {time.time()-t0:.1f}s. Fill mode used: {FILL_MODE}.")
@@ -1851,6 +2049,9 @@ def parse_args() -> argparse.Namespace:
                     help="Fraction of the coarse stage used for refinement (default 0.10).")
     ap.add_argument("--ctf-n-interp", type=int, default=2,
                     help="Interpolation points between numeric top values in the fine stage (default 2).")
+    ap.add_argument("--n-workers", type=int, default=-1,
+                    help="Parallel worker processes (-1 = all CPU cores, 1 = single-threaded). "
+                         "Requires joblib + tqdm (pip install joblib tqdm). Default: -1.")
     return ap.parse_args()
 
 
@@ -1875,6 +2076,7 @@ if __name__ == "__main__":
             ctf_eval_fine=args.ctf_eval_fine,
             ctf_top_frac=args.ctf_top_frac,
             ctf_n_interp=args.ctf_n_interp,
+            n_workers=args.n_workers,
         )
     except Exception as e:
         traceback.print_exc()
