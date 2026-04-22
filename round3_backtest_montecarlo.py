@@ -255,6 +255,14 @@ def load_prices(paths: List[Path]) -> pd.DataFrame:
     out = pd.concat(dfs, ignore_index=True)
     # ask_volume_x is positive in the CSVs; we convert to negative sell_orders
     # later during order-book normalization.
+    # --- Robustness: drop rows with non-positive mid_price (book outage -> 0).
+    # These rows poison log-returns downstream (log(0) -> -inf, pct_change -> inf)
+    # and make feature_diagnostics/monte-carlo summaries come back as NaN.
+    if "mid_price" in out.columns:
+        bad = (~np.isfinite(out["mid_price"])) | (out["mid_price"] <= 0)
+        if bad.any():
+            print(f"[WARN] dropping {int(bad.sum())} price rows with mid_price<=0 or NaN")
+            out = out.loc[~bad].reset_index(drop=True)
     return out
 
 
@@ -664,8 +672,11 @@ def build_feature_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
         if bp is not None and ap is not None:
             df["mid_price"] = (bp + ap) / 2
     df = df.sort_values(["product", "day", "timestamp"]).reset_index(drop=True)
+    # Mask non-positive mid so log-returns are NaN instead of -inf; downstream
+    # consumers drop NaN safely.
+    safe_mid = df["mid_price"].where(df["mid_price"] > 0)
     df["log_ret"] = (
-        df.groupby("product")["mid_price"].apply(lambda s: np.log(s).diff()).reset_index(level=0, drop=True)
+        safe_mid.groupby(df["product"]).apply(lambda s: np.log(s).diff()).reset_index(level=0, drop=True)
     )
     df["rolling_mean_20"] = (
         df.groupby("product")["mid_price"].rolling(20).mean().reset_index(level=0, drop=True)
@@ -683,7 +694,7 @@ def feature_diagnostics(features: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for prod, grp in features.groupby("product"):
-        rets = grp["log_ret"].dropna()
+        rets = grp["log_ret"].replace([np.inf, -np.inf], np.nan).dropna()
         if rets.empty:
             continue
         acf1 = float(rets.autocorr(lag=1)) if len(rets) > 2 else np.nan
@@ -938,6 +949,8 @@ def two_stage_ctf(
     min_top: int = 4,
     max_top: int = 40,
     n_interp: int = 2,
+    rank_metric: str = "sharpe",
+    min_trades: float = 5.0,
 ) -> pd.DataFrame:
     """Explicit two-stage coarse-to-fine grid search.
 
@@ -963,9 +976,29 @@ def two_stage_ctf(
     coarse_df = coarse_df.copy()
     coarse_df["stage"] = "coarse"
 
-    n_top = int(max(min_top, min(max_top, math.ceil(len(coarse_df) * top_frac))))
-    top = coarse_df.nlargest(n_top, "objective_score")
-    print(f"[CTF] stage-1 kept top {len(top)} rows (~{top_frac*100:.0f}%) for refinement")
+    # --- Selection pool: drop zero-/low-trade configs BEFORE ranking so the
+    # top region reflects strategies that actually engage the market, not
+    # degenerate no-op configs whose `objective_score == 0`.
+    pool = coarse_df
+    if "mean_trades_per_path" in pool.columns:
+        active = pool[pool["mean_trades_per_path"] >= min_trades]
+        if len(active) >= max(min_top, 4):
+            pool = active
+            print(f"[CTF] filtered to {len(pool)}/{len(coarse_df)} active configs "
+                  f"(mean_trades_per_path >= {min_trades})")
+        else:
+            print(f"[CTF] WARN: only {len(active)} active configs, keeping full pool")
+    # Ranking metric: default "sharpe" rewards consistency; fall back cleanly
+    # if the requested column is missing.
+    if rank_metric not in pool.columns:
+        print(f"[CTF] WARN: rank_metric='{rank_metric}' missing, falling back to 'mean_profit'")
+        rank_metric = "mean_profit" if "mean_profit" in pool.columns else "objective_score"
+    # Protect against NaN/inf values.
+    pool = pool[np.isfinite(pool[rank_metric])]
+    n_top = int(max(min_top, min(max_top, math.ceil(len(pool) * top_frac))))
+    top = pool.nlargest(n_top, rank_metric)
+    print(f"[CTF] stage-1 kept top {len(top)} rows (~{top_frac*100:.0f}%) "
+          f"ranked by '{rank_metric}' for refinement")
 
     # Build fine_spec: per key take the values that occur in the top region,
     # plus optional numeric interpolation.
@@ -1362,6 +1395,78 @@ def aggregate_path_metrics(
 # -----------------------------------------------------------------------------
 
 _WORKER_TRADER_CACHE: Dict[str, Any] = {}
+# Per-worker shared state populated by :func:`_worker_init` so large objects
+# (MC path arrays, position limits, historical books) are pickled ONCE per
+# worker rather than once per job. For a 9504-combo run this turns a pickle
+# cost of ~150 GB into ~150 MB -- the single biggest runtime win.
+_WORKER_STATE: Dict[str, Any] = {}
+
+
+def _worker_init(
+    trader_path_str: Optional[str],
+    mc_paths: Dict[str, np.ndarray],
+    hist_mids: Optional[Dict[str, np.ndarray]],
+    historical_depths: Optional[Dict],
+    ordered_keys: Optional[List],
+    position_limits: Dict[str, int],
+    max_ticks: Optional[int],
+    market_trades_index: Optional[Dict],
+    n_paths: int,
+    skip_hist_in_grid: bool,
+    risk_lambda: float,
+    have_exact: bool,
+    seed: int,
+) -> None:
+    """Initializer run ONCE per worker process. Stashes the large per-run
+    context into the process-global dict so per-job payloads are tiny.
+    """
+    global _WORKER_STATE
+    _WORKER_STATE = {
+        "trader_path_str": trader_path_str,
+        "mc_paths": mc_paths,
+        "hist_mids": hist_mids,
+        "historical_depths": historical_depths,
+        "ordered_keys": ordered_keys,
+        "position_limits": position_limits,
+        "max_ticks": max_ticks,
+        "market_trades_index": market_trades_index,
+        "n_paths": n_paths,
+        "skip_hist_in_grid": skip_hist_in_grid,
+        "risk_lambda": risk_lambda,
+        "have_exact": have_exact,
+        "seed": seed,
+    }
+    # Silence noisy NaN warnings once per worker.
+    import warnings as _w
+    _w.filterwarnings("ignore", category=RuntimeWarning)
+
+
+def _eval_combo_worker_shared(params: Dict[str, Any], n_eval: int) -> Optional[Dict[str, Any]]:
+    """Thin wrapper that reads all heavy inputs from :data:`_WORKER_STATE`.
+    Dispatched by :func:`_parallel_map` when workers were initialised with
+    shared MC context. Each job only pickles ``(params, n_eval)``.
+    """
+    st = _WORKER_STATE
+    if not st:
+        raise RuntimeError("_WORKER_STATE is empty -- initializer did not run")
+    return _eval_combo_worker(
+        st["trader_path_str"], params, st["mc_paths"], st["hist_mids"],
+        st["historical_depths"], st["ordered_keys"], st["position_limits"],
+        st["max_ticks"], st["market_trades_index"], n_eval, st["n_paths"],
+        st["skip_hist_in_grid"], st["risk_lambda"], st["have_exact"], st["seed"],
+    )
+
+
+def _eval_single_path_worker_shared(params: Dict[str, Any], path_idx: int) -> Dict[str, Any]:
+    """Shared-state equivalent of :func:`_eval_single_path_worker` for the
+    fan-chart and stability stages."""
+    st = _WORKER_STATE
+    if not st:
+        raise RuntimeError("_WORKER_STATE is empty -- initializer was not run")
+    return _eval_single_path_worker(
+        st["trader_path_str"], params, st["mc_paths"], path_idx,
+        st["position_limits"], st["max_ticks"],
+    )
 
 
 def _worker_get_trader_cls(trader_path_str: Optional[str]):
@@ -1485,6 +1590,8 @@ def _parallel_map(
     n_workers: int,
     desc: str = "grid",
     show_progress: bool = True,
+    initializer: Optional[Callable] = None,
+    initargs: Optional[Tuple] = None,
 ) -> List[Any]:
     """Dispatch a list of delayed jobs across ``n_workers`` processes using
     joblib (``loky`` backend). Falls back to a plain serial loop when joblib
@@ -1501,24 +1608,75 @@ def _parallel_map(
     total = len(jobs)
     if total == 0:
         return []
-    if not _HAS_JOBLIB or n_workers == 1:
+    if n_workers == 1:
+        if initializer is not None:
+            initializer(*(initargs or ()))
         iterator = tqdm(jobs, desc=desc, total=total) if show_progress else jobs
         return [worker_fn(*args) for args in iterator]
     n_actual = os.cpu_count() or 1 if n_workers < 0 else min(n_workers, len(jobs))
+
+    # When an initializer is provided we route through a reusable process pool
+    # directly. joblib's high-level Parallel does not accept initializer, and
+    # falling back to per-job pickling would defeat the whole shared-state
+    # optimisation. We use ProcessPoolExecutor with a spawn context so worker
+    # globals are initialised explicitly via the initializer (loky sometimes
+    # respawns workers mid-run and misses late initializer dispatches for the
+    # replacement, which we have seen in practice).
+    if initializer is not None:
+        import multiprocessing as _mp
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        # Cache the executor on the initializer identity + args tuple id so
+        # repeated _parallel_map calls within one pipeline reuse workers
+        # (mc_paths is pickled ONCE per worker for the whole run).
+        cache_key = (id(initializer), id(initargs))
+        pool_cache = getattr(_parallel_map, "_pool_cache", None)
+        if pool_cache is None:
+            pool_cache = {}
+            _parallel_map._pool_cache = pool_cache  # type: ignore[attr-defined]
+        executor = pool_cache.get(cache_key)
+        if executor is None:
+            ctx = _mp.get_context("spawn")
+            executor = ProcessPoolExecutor(
+                max_workers=n_actual,
+                initializer=initializer,
+                initargs=initargs or (),
+                mp_context=ctx,
+            )
+            pool_cache[cache_key] = executor
+        print(f"[PAR] {desc}: dispatching {total} jobs to {n_actual} workers (spawn, shared state)")
+        results: List[Any] = [None] * total
+        futures = {executor.submit(worker_fn, *args): i for i, args in enumerate(jobs)}
+        if show_progress and _HAS_TQDM:
+            with tqdm(total=total, desc=desc) as pbar:
+                for f in as_completed(futures):
+                    idx = futures[f]
+                    results[idx] = f.result()
+                    pbar.update(1)
+        else:
+            for f in as_completed(futures):
+                idx = futures[f]
+                results[idx] = f.result()
+        return results
+
+    if not _HAS_JOBLIB:
+        # Serial fallback with initializer behaviour.
+        if initializer is not None:
+            initializer(*(initargs or ()))
+        iterator = tqdm(jobs, desc=desc, total=total) if show_progress else jobs
+        return [worker_fn(*args) for args in iterator]
+
     print(f"[PAR] {desc}: dispatching {total} jobs to {n_actual} workers (joblib/loky)")
+    parallel_kwargs = dict(n_jobs=n_workers, backend="loky")
     if show_progress and _HAS_TQDM:
-        # Joblib has no native tqdm hook; we use a lightweight wrapper that
-        # advances the bar as futures complete.
         with tqdm(total=total, desc=desc) as pbar:
-            results: List[Any] = [None] * total
+            results = [None] * total
 
             def _wrapped(idx, args):
                 r = worker_fn(*args)
                 return idx, r
 
-            # return_as="generator" streams results as they finish -> live bar.
             try:
-                gen = Parallel(n_jobs=n_workers, backend="loky", return_as="generator")(
+                gen = Parallel(return_as="generator", **parallel_kwargs)(
                     delayed(_wrapped)(i, args) for i, args in enumerate(jobs)
                 )
                 for idx, r in gen:
@@ -1526,16 +1684,14 @@ def _parallel_map(
                     pbar.update(1)
                 return results
             except TypeError:
-                # Older joblib without ``return_as="generator"`` -- fall back
-                # to a blocking call without live progress updates.
-                out = Parallel(n_jobs=n_workers, backend="loky")(
+                out = Parallel(**parallel_kwargs)(
                     delayed(worker_fn)(*args) for args in jobs
                 )
                 pbar.update(total)
                 return list(out)
     else:
         return list(
-            Parallel(n_jobs=n_workers, backend="loky")(
+            Parallel(**parallel_kwargs)(
                 delayed(worker_fn)(*args) for args in jobs
             )
         )
@@ -1557,18 +1713,23 @@ def pareto_frontier(df: pd.DataFrame, x_col: str, y_col: str, maximize_y: bool =
     return pd.DataFrame(front)
 
 
-def pick_top2_robust(full_results: pd.DataFrame) -> pd.DataFrame:
+def pick_top2_robust(full_results: pd.DataFrame, metric: str = "sharpe") -> pd.DataFrame:
     """Robust Top-2 selection combining global score and neighbourhood
-    stability. Stability is measured as the mean objective_score across the
+    stability. Stability is measured as the mean ranking metric across the
     nearest neighbours in (normalised) parameter space.
     """
     if full_results.empty:
         return full_results
     df = full_results.copy()
+    # Fall back cleanly if the requested metric column is missing.
+    if metric not in df.columns:
+        metric = "objective_score" if "objective_score" in df.columns else df.columns[0]
+    # Filter out non-finite metric values so std/mean do not blow up.
+    df = df[np.isfinite(df[metric])].reset_index(drop=True)
+    if df.empty:
+        return df
     # Normalise for the robust score.
-    df["obj_norm"] = (df["objective_score"] - df["objective_score"].mean()) / (
-        df["objective_score"].std() + 1e-9
-    )
+    df["obj_norm"] = (df[metric] - df[metric].mean()) / (df[metric].std() + 1e-9)
     # Neighbour score: mean objective of the K nearest neighbours in
     # numeric-parameter space (Euclidean on z-scored columns).
     num_cols = [
@@ -1682,12 +1843,96 @@ def plot_sensitivity_math_low(df: pd.DataFrame, out: Path):
     save_plot(fig, out)
 
 
-def plot_top_ranking(df: pd.DataFrame, out: Path, n: int = 20):
-    top = df.nlargest(n, "objective_score").reset_index(drop=True)
+def plot_top_ranking(df: pd.DataFrame, out: Path, n: int = 20, metric: str = "sharpe"):
+    if df.empty:
+        return
+    if metric not in df.columns:
+        metric = "objective_score" if "objective_score" in df.columns else df.columns[0]
+    top = df.nlargest(n, metric).reset_index(drop=True)
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar(range(len(top)), top["objective_score"])
-    ax.set_title(f"Top-{n} Parameter Combinations by objective_score")
-    ax.set_xlabel("rank"); ax.set_ylabel("objective_score")
+    ax.bar(range(len(top)), top[metric])
+    ax.set_title(f"Top-{n} Parameter Combinations by {metric}")
+    ax.set_xlabel("rank"); ax.set_ylabel(metric)
+    save_plot(fig, out)
+
+
+def plot_profit_hit_map(df: pd.DataFrame, spec: Dict[str, Any], out: Path,
+                        metric: str = "sharpe"):
+    """2D heat-map over the two highest-cardinality numeric parameters, cells
+    coloured by the mean of ``metric`` (averaged across the other dims).
+    Skips silently if fewer than 2 numeric params are available.
+    """
+    if df.empty:
+        return
+    if metric not in df.columns:
+        metric = "objective_score" if "objective_score" in df.columns else None
+    if metric is None:
+        return
+    numeric_params = [
+        k for k, v in spec.items()
+        if k in df.columns and pd.api.types.is_numeric_dtype(df[k])
+    ]
+    if len(numeric_params) < 2:
+        return
+    ranked = sorted(numeric_params, key=lambda k: -df[k].nunique())
+    k1, k2 = ranked[0], ranked[1]
+    piv = df.pivot_table(index=k1, columns=k2, values=metric, aggfunc="mean")
+    if piv.empty:
+        return
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(piv.values, aspect="auto", origin="lower", cmap="viridis")
+    ax.set_xticks(range(len(piv.columns)))
+    ax.set_xticklabels([f"{c:g}" if isinstance(c, (int, float)) else str(c)
+                        for c in piv.columns], rotation=45)
+    ax.set_yticks(range(len(piv.index)))
+    ax.set_yticklabels([f"{i:g}" if isinstance(i, (int, float)) else str(i)
+                        for i in piv.index])
+    ax.set_xlabel(k2); ax.set_ylabel(k1)
+    ax.set_title(f"Profit hit-map: mean {metric} by {k1} x {k2}")
+    fig.colorbar(im, ax=ax, label=f"mean {metric}")
+    save_plot(fig, out)
+
+
+def plot_parameter_sensitivity(df: pd.DataFrame, spec: Dict[str, Any], out: Path,
+                               metric: str = "sharpe"):
+    """Grid of 1D sensitivity plots: for each numeric parameter in ``spec``,
+    plot mean(metric) +/- std across all grid rows at each value of that
+    parameter. Useful to spot monotone vs peaked responses.
+    """
+    if df.empty:
+        return
+    if metric not in df.columns:
+        metric = "objective_score" if "objective_score" in df.columns else None
+    if metric is None:
+        return
+    numeric_params = [
+        k for k, v in spec.items()
+        if k in df.columns and pd.api.types.is_numeric_dtype(df[k])
+    ]
+    if not numeric_params:
+        return
+    n = len(numeric_params)
+    cols = min(3, n)
+    rows = int(math.ceil(n / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(5.2 * cols, 3.6 * rows),
+                             squeeze=False)
+    for i, key in enumerate(numeric_params):
+        ax = axes[i // cols][i % cols]
+        grp = df.groupby(key)[metric].agg(["mean", "std", "count"]).reset_index()
+        grp = grp.sort_values(key)
+        x = grp[key].values
+        mu = grp["mean"].values
+        sd = grp["std"].fillna(0).values
+        ax.plot(x, mu, marker="o", lw=1.4)
+        ax.fill_between(x, mu - sd, mu + sd, alpha=0.2)
+        ax.set_title(f"{key}")
+        ax.set_xlabel(key); ax.set_ylabel(f"mean {metric}")
+        ax.grid(alpha=0.3)
+    # Blank out unused subplots.
+    for j in range(n, rows * cols):
+        axes[j // cols][j % cols].axis("off")
+    fig.suptitle(f"Parameter sensitivity: mean {metric} vs parameter value",
+                 y=1.02, fontsize=12)
     save_plot(fig, out)
 
 
@@ -1742,18 +1987,18 @@ def run_pipeline(
     ctf_top_frac: float = 0.10,
     ctf_n_interp: int = 2,
     n_workers: int = -1,
+    rank_metric: str = "sharpe",
+    min_trades_filter: float = 5.0,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
     # -- Parallel-execution banner.
-    if _HAS_JOBLIB and n_workers != 1:
+    if n_workers != 1:
         eff = (os.cpu_count() or 1) if n_workers < 1 else n_workers
-        print(f"[INFO] parallel mode: joblib/loky, n_workers={n_workers} (effective ~{eff})")
+        print(f"[INFO] parallel mode: spawn + shared-state, n_workers={n_workers} "
+              f"(effective ~{eff})")
     else:
-        if not _HAS_JOBLIB and n_workers != 1:
-            print("[WARN] joblib not installed -- falling back to single-threaded execution. "
-                  "Install with: pip install joblib tqdm")
         print("[INFO] parallel mode: off (single-threaded)")
 
     # -- Discover & load.
@@ -1877,37 +2122,38 @@ def run_pipeline(
     # the Trader class itself may not be; workers re-import by path).
     trader_path_str = str(trader_path) if trader_path else None
 
+    # Shared-state initialiser args. These are pickled ONCE per worker
+    # process instead of once per job -- a ~1000x reduction in pickle traffic
+    # for the grid stage.
+    worker_init_args = (
+        trader_path_str,
+        mc_paths,
+        hist_mids if not skip_hist_in_grid else None,
+        historical_depths if not skip_hist_in_grid else None,
+        ordered_keys if not skip_hist_in_grid else None,
+        position_limits,
+        max_ticks,
+        market_trades_index if not skip_hist_in_grid else None,
+        n_paths,
+        skip_hist_in_grid,
+        risk_lambda,
+        have_exact,
+        seed,
+    )
+
     def _make_batch_runner(n_eval: int) -> Callable[[List[Dict[str, Any]]], pd.DataFrame]:
         n_eval = max(1, min(n_paths, n_eval))
 
         def run_batch(combos: List[Dict[str, Any]]) -> pd.DataFrame:
-            # Build the argument tuples for every combo -- all inputs are
-            # already picklable (dicts of numpy arrays + primitives).
-            jobs = [
-                (
-                    trader_path_str,
-                    c,
-                    mc_paths,
-                    hist_mids if not skip_hist_in_grid else None,
-                    historical_depths if not skip_hist_in_grid else None,
-                    ordered_keys if not skip_hist_in_grid else None,
-                    position_limits,
-                    max_ticks,
-                    market_trades_index if not skip_hist_in_grid else None,
-                    n_eval,
-                    n_paths,
-                    skip_hist_in_grid,
-                    risk_lambda,
-                    have_exact,
-                    seed,
-                )
-                for c in combos
-            ]
+            # Per-job payload is now tiny: just (params, n_eval).
+            jobs = [(c, n_eval) for c in combos]
             results = _parallel_map(
                 jobs,
-                _eval_combo_worker,
+                _eval_combo_worker_shared,
                 n_workers=n_workers,
                 desc=f"grid (n_eval={n_eval})",
+                initializer=_worker_init,
+                initargs=worker_init_args,
             )
             rows = [r for r in results if r is not None]
             return pd.DataFrame(rows)
@@ -1926,29 +2172,66 @@ def run_pipeline(
         full_results = two_stage_ctf(
             spec, run_batch_coarse, run_batch_fine,
             top_frac=ctf_top_frac, n_interp=ctf_n_interp,
+            rank_metric=rank_metric, min_trades=min_trades_filter,
         )
     else:
         print(f"[INFO] Running single-stage grid search (eval_paths={eval_paths})")
         run_batch = _make_batch_runner(eval_paths)
         full_results = coarse_to_fine_grid(spec, run_batch, top_k=6)
+
+    # --- Drop zombie rows: configs that never traded contribute zero signal
+    # to any downstream analysis and only dilute the CSV. We keep one flat
+    # 'active' frame for ranking + plots.
+    full_results_full = full_results.copy()
+    if "mean_trades_per_path" in full_results.columns:
+        active_mask = full_results["mean_trades_per_path"] >= min_trades_filter
+        n_drop = int((~active_mask).sum())
+        if n_drop > 0:
+            print(f"[INFO] dropping {n_drop} zero-/low-trade rows from output "
+                  f"(mean_trades_per_path < {min_trades_filter})")
+        full_results = full_results[active_mask].reset_index(drop=True)
     full_results.to_csv(out_dir / "full_grid_results.csv", index=False)
-    print(f"[INFO] grid results: {len(full_results)} rows")
+    print(f"[INFO] grid results (active): {len(full_results)} rows "
+          f"(of {len(full_results_full)} total)")
 
     # -- Pareto + robust Top-2.
     pareto = pareto_frontier(full_results.dropna(subset=["variance", "mean_profit"]),
                              x_col="variance", y_col="mean_profit", maximize_y=True)
     pareto.to_csv(out_dir / "pareto_front.csv", index=False)
 
-    top2 = pick_top2_robust(full_results)
+    # --- New artifact: Top-10 by Sharpe (submission-ready candidates).
+    if "sharpe" in full_results.columns and not full_results.empty:
+        top10_by_sharpe = full_results.nlargest(10, "sharpe").reset_index(drop=True)
+        top10_by_sharpe.to_csv(out_dir / "top10_by_sharpe.csv", index=False)
+        print("[INFO] Top-10 by Sharpe (submission candidates):")
+        show_cols = [c for c in [*spec.keys(), "mean_profit", "median_profit",
+                                 "sharpe", "profit_per_trade", "mean_trades_per_path",
+                                 "VaR_5", "CVaR_5"] if c in top10_by_sharpe.columns]
+        print(top10_by_sharpe[show_cols].to_string(index=False))
+
+    top2 = pick_top2_robust(full_results, metric=rank_metric)
     top2.to_csv(out_dir / "top_parameter_pairs.csv", index=False)
-    print("[INFO] Robust Top-2 parameter sets:")
+    print(f"[INFO] Robust Top-2 parameter sets (ranked by '{rank_metric}'):")
     print(top2.to_string(index=False))
 
     # -- Visualization.
     # Historical equity for best params (one EXACT run, no grid overhead).
-    if not top2.empty:
-        best = top2.iloc[0].to_dict()
-        best_params = {k: best[k] for k in spec.keys() if k in best}
+    # 'Best' is picked using the ranking metric from the active pool, so the
+    # fan chart and equity curve reflect a strategy that actually trades.
+    best_row = None
+    if not full_results.empty and rank_metric in full_results.columns:
+        best_row = full_results.nlargest(1, rank_metric).iloc[0].to_dict()
+        best_params = {k: best_row[k] for k in spec.keys() if k in best_row}
+        print(f"[INFO] Best params by '{rank_metric}': {best_params} "
+              f"(mean_profit={best_row.get('mean_profit', float('nan')):.1f}, "
+              f"sharpe={best_row.get('sharpe', float('nan')):.3f})")
+    elif not top2.empty:
+        best_row = top2.iloc[0].to_dict()
+        best_params = {k: best_row[k] for k in spec.keys() if k in best_row}
+    else:
+        best_params = None
+
+    if best_params is not None:
         hist_res = run_backtest_on_series(
             trader_cls, best_params,
             mids_by_product=hist_mids,
@@ -1960,13 +2243,25 @@ def run_pipeline(
         )
         plot_equity_curve(hist_res["equity_curve"], out_dir / "plot_equity_curve.png")
 
+        # Dump best params as JSON for easy reproducibility.
+        import json as _json
+        _br = best_row or {}
+        (out_dir / "best_params.json").write_text(_json.dumps({
+            "params": best_params,
+            "rank_metric": rank_metric,
+            "mean_profit": float(_br.get("mean_profit", float("nan"))),
+            "sharpe": float(_br.get("sharpe", float("nan"))),
+            "profit_per_trade": float(_br.get("profit_per_trade", float("nan"))),
+            "mean_trades_per_path": float(_br.get("mean_trades_per_path", float("nan"))),
+        }, indent=2, default=str))
+
         # Fan chart + final PnL distribution for the best params (parallel).
         fan_jobs = [
-            (trader_path_str, best_params, mc_paths, i, position_limits, max_ticks)
-            for i in range(min(eval_paths_final, n_paths))
+            (best_params, i) for i in range(min(eval_paths_final, n_paths))
         ]
         fan_results = _parallel_map(
-            fan_jobs, _eval_single_path_worker, n_workers=n_workers, desc="fan-chart",
+            fan_jobs, _eval_single_path_worker_shared, n_workers=n_workers,
+            desc="fan-chart", initializer=_worker_init, initargs=worker_init_args,
         )
         path_curves = [r["equity_curve"] for r in fan_results if r is not None]
         finals = [r["final_pnl"] for r in fan_results if r is not None]
@@ -1977,8 +2272,16 @@ def run_pipeline(
 
     plot_profit_vs_variance(full_results, out_dir / "plot_profit_vs_variance.png")
     plot_pareto(full_results, pareto, out_dir / "plot_pareto.png")
-    plot_top_ranking(full_results, out_dir / "plot_top_ranking.png")
+    plot_top_ranking(full_results, out_dir / "plot_top_ranking.png",
+                     metric=rank_metric)
     plot_sensitivity_math_low(full_results, out_dir / "plot_sensitivity_mathematical_low.png")
+
+    # --- New artifacts: profit-hit-map and per-parameter sensitivity.
+    plot_profit_hit_map(full_results, spec, out_dir / "plot_profit_hit_map.png",
+                        metric=rank_metric)
+    plot_parameter_sensitivity(full_results, spec,
+                               out_dir / "plot_parameter_sensitivity.png",
+                               metric=rank_metric)
 
     # Heatmap for the 2 most informative parameters (by column cardinality).
     num_params = [
@@ -1992,7 +2295,8 @@ def run_pipeline(
         plot_heatmap_top2(full_results, (k1, k2), out_dir / f"plot_heatmap_{k1}_vs_{k2}.png")
 
     # Stability box plot for top-K (parallel across combos x paths).
-    top_k = full_results.nlargest(5, "objective_score")
+    _stab_metric = rank_metric if rank_metric in full_results.columns else "objective_score"
+    top_k = full_results.nlargest(5, _stab_metric)
     stab_n = min(eval_paths_final // 2 if eval_paths_final >= 20 else 20, n_paths)
     stab_param_rows = [
         {k: r[k] for k in spec.keys() if k in r} for _, r in top_k.iterrows()
@@ -2001,11 +2305,11 @@ def run_pipeline(
         "|".join(f"{k}={p[k]}" for k in list(p)[:2]) for p in stab_param_rows
     ]
     stab_jobs = [
-        (trader_path_str, p, mc_paths, i, position_limits, max_ticks)
-        for p in stab_param_rows for i in range(stab_n)
+        (p, i) for p in stab_param_rows for i in range(stab_n)
     ]
     stab_results = _parallel_map(
-        stab_jobs, _eval_single_path_worker, n_workers=n_workers, desc="stability",
+        stab_jobs, _eval_single_path_worker_shared, n_workers=n_workers,
+        desc="stability", initializer=_worker_init, initargs=worker_init_args,
     )
     per_path_list = []
     for ci in range(len(stab_param_rows)):
@@ -2052,6 +2356,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--n-workers", type=int, default=-1,
                     help="Parallel worker processes (-1 = all CPU cores, 1 = single-threaded). "
                          "Requires joblib + tqdm (pip install joblib tqdm). Default: -1.")
+    ap.add_argument("--rank-metric", type=str, default="sharpe",
+                    choices=["sharpe", "mean_profit", "profit_per_trade",
+                             "objective_score", "median_profit"],
+                    help="Metric used to rank grid results (default: sharpe). "
+                         "objective_score (mean - lambda*variance) is numerically "
+                         "brittle when variance ~1e10; sharpe rewards consistency.")
+    ap.add_argument("--min-trades-filter", type=float, default=5.0,
+                    help="Drop configs with mean_trades_per_path < this value before "
+                         "ranking and from the final output CSV. Default: 5.0.")
     return ap.parse_args()
 
 
@@ -2077,6 +2390,8 @@ if __name__ == "__main__":
             ctf_top_frac=args.ctf_top_frac,
             ctf_n_interp=args.ctf_n_interp,
             n_workers=args.n_workers,
+            rank_metric=args.rank_metric,
+            min_trades_filter=args.min_trades_filter,
         )
     except Exception as e:
         traceback.print_exc()
