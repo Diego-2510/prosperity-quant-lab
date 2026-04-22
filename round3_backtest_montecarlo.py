@@ -105,6 +105,32 @@ except ImportError:
 # optional CLI override). No P3 product name is treated as a P4 fact.
 DEFAULT_POSITION_LIMIT = 50  # ASSUMPTION: fallback only when data yields no limit.
 
+# Known position limits from Prosperity.txt (P4 authoritative) and
+# FrankfurtHedgehogs_polished.py (P3 Place-2 reference, 2024 data). These are
+# used when the CSV files belong to those products -- inferring from observed
+# order-book volume drastically over-estimates limits for small-cap products.
+KNOWN_POSITION_LIMITS: Dict[str, int] = {
+    # --- Prosperity 4 (authoritative from Prosperity.txt) ---
+    "ASH_COATED_OSMIUM": 80,
+    "INTARIAN_PEPPER_ROOT": 80,
+    # --- Prosperity 3 2024 (from FrankfurtHedgehogs reference) ---
+    "RAINFOREST_RESIN": 50,
+    "KELP": 50,
+    "SQUID_INK": 50,
+    "PICNIC_BASKET1": 60,
+    "PICNIC_BASKET2": 100,
+    "CROISSANTS": 250,
+    "JAMS": 350,
+    "DJEMBES": 60,
+    "VOLCANIC_ROCK": 400,
+    "VOLCANIC_ROCK_VOUCHER_9500": 200,
+    "VOLCANIC_ROCK_VOUCHER_9750": 200,
+    "VOLCANIC_ROCK_VOUCHER_10000": 200,
+    "VOLCANIC_ROCK_VOUCHER_10250": 200,
+    "VOLCANIC_ROCK_VOUCHER_10500": 200,
+    "MAGNIFICENT_MACARONS": 75,
+}
+
 # ASSUMPTION: official Prosperity CSVs use a 100-ms tick grid (timestamp in
 # steps of 100). The framework only relies on numeric ordering.
 TICK_STEP = 100
@@ -1329,17 +1355,37 @@ def two_stage_ctf(
 # =============================================================================
 
 
-def infer_position_limits(prices_df: pd.DataFrame) -> Dict[str, int]:
-    """ASSUMPTION: without authoritative P4 limit info we fall back to a
-    conservative estimate from the largest observed per-snapshot volume,
-    floored at :data:`DEFAULT_POSITION_LIMIT`."""
+def infer_position_limits(
+    prices_df: pd.DataFrame,
+    overrides: Optional[Dict[str, int]] = None,
+) -> Dict[str, int]:
+    """Resolve per-product position limits.
+
+    Priority: user CLI overrides -> KNOWN_POSITION_LIMITS (P4 authoritative /
+    P3 reference) -> DEFAULT_POSITION_LIMIT fallback. The previous
+    ``max(observed volume)`` heuristic was removed because it over-estimated
+    small-cap limits by 3-5x (e.g. JAMS reported 350 official vs observed
+    volume peak of 305; CROISSANTS official 250 vs observed 172) and under-
+    estimated none -- no realistic P4 product has a higher limit than
+    suggested by the order book. Using authoritative limits is a correctness
+    win for every metric that depends on capped position (PnL, drawdown,
+    turnover, hit_rate_active).
+    """
+    overrides = overrides or {}
     if prices_df.empty:
-        return {}
+        return dict(overrides)
     limits: Dict[str, int] = {}
-    for prod, grp in prices_df.groupby("product"):
-        vol_cols = [c for c in prices_df.columns if "volume" in c]
-        maxvol = float(grp[vol_cols].abs().max().max()) if vol_cols else 0
-        limits[str(prod)] = max(DEFAULT_POSITION_LIMIT, int(math.ceil(maxvol)))
+    for prod in prices_df["product"].unique():
+        prod_s = str(prod)
+        if prod_s in overrides:
+            limits[prod_s] = int(overrides[prod_s])
+        elif prod_s in KNOWN_POSITION_LIMITS:
+            limits[prod_s] = int(KNOWN_POSITION_LIMITS[prod_s])
+        else:
+            limits[prod_s] = int(DEFAULT_POSITION_LIMIT)
+            print(f"[WARN] no known position limit for '{prod_s}', "
+                  f"falling back to DEFAULT_POSITION_LIMIT={DEFAULT_POSITION_LIMIT}. "
+                  f"Pass --position-limit {prod_s}=N to override.")
     return limits
 
 
@@ -2343,6 +2389,8 @@ def run_pipeline(
     min_trades_filter: float = 5.0,
     mc_method: str = "bootstrap",
     ou_overrides: Optional[Dict[str, Dict[str, float]]] = None,
+    mc_method_overrides: Optional[Dict[str, str]] = None,
+    position_limit_overrides: Optional[Dict[str, int]] = None,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -2407,7 +2455,7 @@ def run_pipeline(
     diag.to_csv(out_dir / "feature_diagnostics.csv", index=False)
 
     # -- Position limits.
-    position_limits = infer_position_limits(prices_df)
+    position_limits = infer_position_limits(prices_df, overrides=position_limit_overrides)
     print(f"[INFO] inferred position limits: {position_limits}")
 
     # -- Historical depths (EXACT fill when possible).
@@ -2452,10 +2500,25 @@ def run_pipeline(
     print(f"[INFO] Parameter registry keys: {list(spec.keys())}")
 
     # -- Monte-Carlo paths (truncated to max_ticks if set).
+    # Per-product method resolution: base = global mc_method, overrides win.
+    mc_method_overrides = dict(mc_method_overrides or {})
+    all_products = list(prices_df["product"].unique())
+    per_prod_method: Dict[str, str] = {
+        p: mc_method_overrides.get(p, mc_method) for p in all_products
+    }
+    any_ou = any(m == "ou" for m in per_prod_method.values())
+    any_bs = any(m == "bootstrap" for m in per_prod_method.values())
+    if mc_method_overrides:
+        print("[INFO] MC-method per product:")
+        for p, m in per_prod_method.items():
+            tag = " (override)" if p in mc_method_overrides else ""
+            print(f"    {p:<30s} -> {m}{tag}")
+
     ou_params: Dict[str, Dict[str, float]] = {}
-    if mc_method == "ou":
+    mc_paths: Dict[str, np.ndarray] = {}
+    if any_ou:
         print(f"[INFO] Generating {n_paths} Ornstein-Uhlenbeck paths ...")
-        mc_paths, ou_params = generate_monte_carlo_paths_ou(
+        ou_paths_full, ou_params = generate_monte_carlo_paths_ou(
             prices_df, n_paths=n_paths, seed=seed,
             overrides=ou_overrides, horizon=max_ticks,
         )
@@ -2489,9 +2552,24 @@ def run_pipeline(
             row.update({k: v for k, v in fit.items()})
             cal_rows.append(row)
         pd.DataFrame(cal_rows).to_csv(out_dir / "ou_calibration.csv", index=False)
-    else:
+
+    if any_bs:
         print(f"[INFO] Generating {n_paths} Monte-Carlo paths (bootstrap) ...")
-        mc_paths = generate_monte_carlo_paths(prices_df, n_paths=n_paths, seed=seed)
+        bs_paths_full = generate_monte_carlo_paths(prices_df, n_paths=n_paths, seed=seed)
+    else:
+        bs_paths_full = {}
+
+    # Assemble final mc_paths by picking per-product method.
+    for p in all_products:
+        m = per_prod_method.get(p, mc_method)
+        if m == "ou" and p in (ou_paths_full if any_ou else {}):
+            mc_paths[p] = ou_paths_full[p]
+        elif m == "bootstrap" and p in bs_paths_full:
+            mc_paths[p] = bs_paths_full[p]
+        elif any_ou and p in ou_paths_full:
+            mc_paths[p] = ou_paths_full[p]
+        elif p in bs_paths_full:
+            mc_paths[p] = bs_paths_full[p]
     if max_ticks is not None and max_ticks > 0:
         mc_paths = {p: arr[:, :max_ticks] for p, arr in mc_paths.items()}
     products = list(mc_paths.keys())
@@ -2503,17 +2581,20 @@ def run_pipeline(
             horizon=arr.shape[1],
             mean_final=float(arr[:, -1].mean()),
             std_final=float(arr[:, -1].std()),
-            method=mc_method,
+            method=per_prod_method.get(p, mc_method),
         ))
     pd.DataFrame(mc_summary_rows).to_csv(out_dir / "monte_carlo_summary.csv", index=False)
 
     # OU validation plot (historical + simulated + terminal distribution).
-    if mc_method == "ou" and ou_params:
-        try:
-            plot_ou_calibration(prices_df, mc_paths, ou_params,
-                                out_dir / "plot_ou_calibration.png")
-        except Exception as e:
-            print(f"[WARN] plot_ou_calibration failed: {e}")
+    if any_ou and ou_params:
+        ou_only_paths = {p: mc_paths[p] for p in ou_params.keys()
+                         if per_prod_method.get(p, mc_method) == "ou" and p in mc_paths}
+        if ou_only_paths:
+            try:
+                plot_ou_calibration(prices_df, ou_only_paths, ou_params,
+                                    out_dir / "plot_ou_calibration.png")
+            except Exception as e:
+                print(f"[WARN] plot_ou_calibration failed: {e}")
 
     # -- Backtest-Runner (single param, over MC paths).
     T_path = min(arr.shape[1] for arr in mc_paths.values()) if mc_paths else 0
@@ -2719,7 +2800,12 @@ def run_pipeline(
         per_path_list.append(profits)
     plot_stability(per_path_list, labels, out_dir / "plot_stability_topK.png")
 
-    print(f"[INFO] DONE in {time.time()-t0:.1f}s. Fill mode used: {FILL_MODE}.")
+    # Final FILL_MODE reflects the last backtest run. MC-path runs always use
+    # APPROX (synthetic order books from simulated mids), so the last value
+    # printed corresponds to the fan-chart/stability leg. The historical-EXACT
+    # leg (if enabled via --grid-with-hist) uses real order books.
+    print(f"[INFO] DONE in {time.time()-t0:.1f}s. Last fill mode: {FILL_MODE} "
+          f"(MC paths always APPROX; historical leg uses EXACT when enabled).")
     print(f"[INFO] Artifacts written to: {out_dir}")
 
 
@@ -2779,6 +2865,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ou-override", action="append", default=[],
                     help="Per-product OU override, format 'PRODUCT:theta=X,mu=Y,sigma=Z' "
                          "(any subset of keys). Repeatable.")
+    ap.add_argument("--mc-method-override", action="append", default=[],
+                    help="Per-product MC-method override, format 'PRODUCT=ou' or "
+                         "'PRODUCT=bootstrap'. Repeatable. Overrides --mc-method "
+                         "for the listed products only (e.g. OU for mean-reverting "
+                         "products, bootstrap for trending/jumpy ones).")
+    ap.add_argument("--position-limit", action="append", default=[],
+                    help="Per-product position-limit override, format 'PRODUCT=N'. "
+                         "Repeatable. Overrides the authoritative KNOWN_POSITION_LIMITS "
+                         "table for the listed products only.")
     return ap.parse_args()
 
 
@@ -2830,6 +2925,46 @@ def _parse_ou_overrides(global_theta: Optional[float],
     return overrides
 
 
+def _parse_kv_int_overrides(raw_list: List[str], label: str) -> Dict[str, int]:
+    """Parse a repeatable 'PRODUCT=N' CLI flag into a {product: int} dict."""
+    out: Dict[str, int] = {}
+    for raw in raw_list or []:
+        if "=" not in raw:
+            print(f"[WARN] Ignoring --{label} '{raw}': missing '=' (expected PRODUCT=N)")
+            continue
+        prod, val = raw.split("=", 1)
+        prod = prod.strip()
+        if not prod:
+            continue
+        try:
+            out[prod] = int(val.strip())
+        except ValueError:
+            print(f"[WARN] Ignoring --{label} '{raw}': '{val}' is not an integer")
+    return out
+
+
+def _parse_kv_str_overrides(
+    raw_list: List[str], label: str, allowed: List[str]
+) -> Dict[str, str]:
+    """Parse a repeatable 'PRODUCT=value' CLI flag into a {product: str} dict,
+    validating value against ``allowed``."""
+    out: Dict[str, str] = {}
+    for raw in raw_list or []:
+        if "=" not in raw:
+            print(f"[WARN] Ignoring --{label} '{raw}': missing '=' (expected PRODUCT=value)")
+            continue
+        prod, val = raw.split("=", 1)
+        prod = prod.strip()
+        val = val.strip().lower()
+        if not prod:
+            continue
+        if val not in allowed:
+            print(f"[WARN] Ignoring --{label} '{raw}': value must be one of {allowed}")
+            continue
+        out[prod] = val
+    return out
+
+
 if __name__ == "__main__":
     args = parse_args()
     try:
@@ -2857,6 +2992,12 @@ if __name__ == "__main__":
             mc_method=args.mc_method,
             ou_overrides=_parse_ou_overrides(
                 args.ou_theta, args.ou_mu, args.ou_sigma, args.ou_override,
+            ),
+            mc_method_overrides=_parse_kv_str_overrides(
+                args.mc_method_override, "mc-method-override", ["ou", "bootstrap"],
+            ),
+            position_limit_overrides=_parse_kv_int_overrides(
+                args.position_limit, "position-limit",
             ),
         )
     except Exception as e:
