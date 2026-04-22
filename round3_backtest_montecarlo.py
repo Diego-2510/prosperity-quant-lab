@@ -1837,6 +1837,7 @@ def _worker_init(
     risk_lambda: float,
     have_exact: bool,
     seed: int,
+    lean_metrics: bool = False,
 ) -> None:
     """Initializer run ONCE per worker process. Stashes the large per-run
     context into the process-global dict so per-job payloads are tiny.
@@ -1856,6 +1857,7 @@ def _worker_init(
         "risk_lambda": risk_lambda,
         "have_exact": have_exact,
         "seed": seed,
+        "lean_metrics": lean_metrics,
     }
     # Silence noisy NaN warnings once per worker.
     import warnings as _w
@@ -1875,6 +1877,7 @@ def _eval_combo_worker_shared(params: Dict[str, Any], n_eval: int) -> Optional[D
         st["historical_depths"], st["ordered_keys"], st["position_limits"],
         st["max_ticks"], st["market_trades_index"], n_eval, st["n_paths"],
         st["skip_hist_in_grid"], st["risk_lambda"], st["have_exact"], st["seed"],
+        st.get("lean_metrics", False),
     )
 
 
@@ -1920,6 +1923,7 @@ def _eval_combo_worker(
     risk_lambda: float,
     have_exact: bool,
     seed: int,
+    lean_metrics: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Evaluate ONE parameter combination across ``n_eval`` Monte-Carlo paths
     (and optionally one historical EXACT backtest). Designed to run inside a
@@ -1973,12 +1977,15 @@ def _eval_combo_worker(
             # below. Previously these were taken ONLY from hist_res, which is
             # zeroed-out in grid mode (skip_hist_in_grid=True), so every grid
             # row reported 0.0 for drawdown / hit-rate / turnover / inv_std.
-            drawdowns.append(float(r.get("max_drawdown", 0.0)))
-            hit_rates.append(float(r.get("hit_rate", 0.0)))
-            hit_rates_active.append(float(r.get("hit_rate_active", 0.0)))
-            round_trips.append(int(r.get("n_round_trips", 0)))
-            turnovers.append(float(r.get("turnover", 0.0)))
-            inv_stds.append(float(r.get("inventory_std", 0.0)))
+            # With --lean-metrics these six list-appends are skipped -- cuts
+            # ~5-10% off the per-combo loop for configs that don't use them.
+            if not lean_metrics:
+                drawdowns.append(float(r.get("max_drawdown", 0.0)))
+                hit_rates.append(float(r.get("hit_rate", 0.0)))
+                hit_rates_active.append(float(r.get("hit_rate_active", 0.0)))
+                round_trips.append(int(r.get("n_round_trips", 0)))
+                turnovers.append(float(r.get("turnover", 0.0)))
+                inv_stds.append(float(r.get("inventory_std", 0.0)))
 
         profits_arr = np.array(profits)
         trades_arr = np.array(trade_counts)
@@ -2441,6 +2448,9 @@ def run_pipeline(
     ou_overrides: Optional[Dict[str, Dict[str, float]]] = None,
     mc_method_overrides: Optional[Dict[str, str]] = None,
     position_limit_overrides: Optional[Dict[str, int]] = None,
+    skip_stability: bool = False,
+    skip_extra_plots: bool = False,
+    lean_metrics: bool = False,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -2681,6 +2691,7 @@ def run_pipeline(
         risk_lambda,
         have_exact,
         seed,
+        lean_metrics,
     )
 
     def _make_batch_runner(n_eval: int) -> Callable[[List[Dict[str, Any]]], pd.DataFrame]:
@@ -2812,53 +2823,59 @@ def run_pipeline(
         plot_fan_chart(eq_matrix, out_dir / "plot_mc_fan_chart.png")
         plot_final_pnl_dist(np.array(finals), out_dir / "plot_final_pnl_dist.png")
 
+    # --- Core plots (always generated -- these are the submission essentials). ---
     plot_profit_vs_variance(full_results, out_dir / "plot_profit_vs_variance.png")
     plot_pareto(full_results, pareto, out_dir / "plot_pareto.png")
     plot_top_ranking(full_results, out_dir / "plot_top_ranking.png",
                      metric=rank_metric)
-    plot_sensitivity_math_low(full_results, out_dir / "plot_sensitivity_mathematical_low.png")
 
-    # --- New artifacts: profit-hit-map and per-parameter sensitivity.
-    plot_profit_hit_map(full_results, spec, out_dir / "plot_profit_hit_map.png",
-                        metric=rank_metric)
-    plot_parameter_sensitivity(full_results, spec,
-                               out_dir / "plot_parameter_sensitivity.png",
-                               metric=rank_metric)
+    # --- Extra diagnostic plots (skippable for smoke tests). ---
+    if not skip_extra_plots:
+        plot_sensitivity_math_low(full_results, out_dir / "plot_sensitivity_mathematical_low.png")
+        plot_profit_hit_map(full_results, spec, out_dir / "plot_profit_hit_map.png",
+                            metric=rank_metric)
+        plot_parameter_sensitivity(full_results, spec,
+                                   out_dir / "plot_parameter_sensitivity.png",
+                                   metric=rank_metric)
+        # Heatmap for the 2 most informative parameters (by column cardinality).
+        num_params = [
+            k for k, v in spec.items()
+            if k in full_results.columns and pd.api.types.is_numeric_dtype(full_results[k])
+        ]
+        if len(num_params) >= 2:
+            variances = [(k, full_results[k].nunique()) for k in num_params]
+            variances.sort(key=lambda x: -x[1])
+            k1, k2 = variances[0][0], variances[1][0]
+            plot_heatmap_top2(full_results, (k1, k2), out_dir / f"plot_heatmap_{k1}_vs_{k2}.png")
+    else:
+        print("[INFO] skip_extra_plots=True -- skipping sensitivity/hit-map/heatmap plots")
 
-    # Heatmap for the 2 most informative parameters (by column cardinality).
-    num_params = [
-        k for k, v in spec.items()
-        if k in full_results.columns and pd.api.types.is_numeric_dtype(full_results[k])
-    ]
-    if len(num_params) >= 2:
-        variances = [(k, full_results[k].nunique()) for k in num_params]
-        variances.sort(key=lambda x: -x[1])
-        k1, k2 = variances[0][0], variances[1][0]
-        plot_heatmap_top2(full_results, (k1, k2), out_dir / f"plot_heatmap_{k1}_vs_{k2}.png")
-
-    # Stability box plot for top-K (parallel across combos x paths).
-    _stab_metric = rank_metric if rank_metric in full_results.columns else "objective_score"
-    top_k = full_results.nlargest(5, _stab_metric)
-    stab_n = min(eval_paths_final // 2 if eval_paths_final >= 20 else 20, n_paths)
-    stab_param_rows = [
-        {k: r[k] for k in spec.keys() if k in r} for _, r in top_k.iterrows()
-    ]
-    labels = [
-        "|".join(f"{k}={p[k]}" for k in list(p)[:2]) for p in stab_param_rows
-    ]
-    stab_jobs = [
-        (p, i) for p in stab_param_rows for i in range(stab_n)
-    ]
-    stab_results = _parallel_map(
-        stab_jobs, _eval_single_path_worker_shared, n_workers=n_workers,
-        desc="stability", initializer=_worker_init, initargs=worker_init_args,
-    )
-    per_path_list = []
-    for ci in range(len(stab_param_rows)):
-        chunk = stab_results[ci * stab_n:(ci + 1) * stab_n]
-        profits = np.array([r["final_pnl"] for r in chunk if r is not None])
-        per_path_list.append(profits)
-    plot_stability(per_path_list, labels, out_dir / "plot_stability_topK.png")
+    # --- Stability box plot (optional, ~100 extra backtests). ---
+    if not skip_stability:
+        _stab_metric = rank_metric if rank_metric in full_results.columns else "objective_score"
+        top_k = full_results.nlargest(5, _stab_metric)
+        stab_n = min(eval_paths_final // 2 if eval_paths_final >= 20 else 20, n_paths)
+        stab_param_rows = [
+            {k: r[k] for k in spec.keys() if k in r} for _, r in top_k.iterrows()
+        ]
+        labels = [
+            "|".join(f"{k}={p[k]}" for k in list(p)[:2]) for p in stab_param_rows
+        ]
+        stab_jobs = [
+            (p, i) for p in stab_param_rows for i in range(stab_n)
+        ]
+        stab_results = _parallel_map(
+            stab_jobs, _eval_single_path_worker_shared, n_workers=n_workers,
+            desc="stability", initializer=_worker_init, initargs=worker_init_args,
+        )
+        per_path_list = []
+        for ci in range(len(stab_param_rows)):
+            chunk = stab_results[ci * stab_n:(ci + 1) * stab_n]
+            profits = np.array([r["final_pnl"] for r in chunk if r is not None])
+            per_path_list.append(profits)
+        plot_stability(per_path_list, labels, out_dir / "plot_stability_topK.png")
+    else:
+        print("[INFO] skip_stability=True -- skipping top-K stability box-plot stage")
 
     # Final FILL_MODE reflects the last backtest run. MC-path runs always use
     # APPROX (synthetic order books from simulated mids), so the last value
@@ -2934,6 +2951,19 @@ def parse_args() -> argparse.Namespace:
                     help="Per-product position-limit override, format 'PRODUCT=N'. "
                          "Repeatable. Overrides the authoritative KNOWN_POSITION_LIMITS "
                          "table for the listed products only.")
+    # Speed knobs -- skip optional diagnostics to shave wall-clock time.
+    ap.add_argument("--skip-stability", action="store_true",
+                    help="Skip the top-K stability box-plot stage (~100 extra backtests). "
+                         "Recommended for smoke tests -- the fan chart already shows "
+                         "per-path variance for the best params.")
+    ap.add_argument("--skip-extra-plots", action="store_true",
+                    help="Skip the heatmap, parameter-sensitivity and profit-hit-map "
+                         "plots. Keeps the essentials (equity curve, fan chart, Pareto, "
+                         "OU calibration, top-ranking, final PnL distribution).")
+    ap.add_argument("--lean-metrics", action="store_true",
+                    help="Skip per-path risk metrics (drawdown, hit-rate, turnover, "
+                         "inventory-std, round-trips) during grid evaluation. "
+                         "Keeps only final_pnl + n_trades -- faster per-combo loop.")
     return ap.parse_args()
 
 
@@ -3059,6 +3089,9 @@ if __name__ == "__main__":
             position_limit_overrides=_parse_kv_int_overrides(
                 args.position_limit, "position-limit",
             ),
+            skip_stability=args.skip_stability,
+            skip_extra_plots=args.skip_extra_plots,
+            lean_metrics=args.lean_metrics,
         )
     except Exception as e:
         traceback.print_exc()

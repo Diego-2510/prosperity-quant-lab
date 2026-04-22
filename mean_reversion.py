@@ -77,24 +77,36 @@ class Trader:
     DEFAULT_LIMIT = 50
 
     # Grid-search parameter registry (picked up by the backtester).
-    # Coarse grid -- combine with ``--ctf --ctf-n-interp 24`` to reach a
-    # 0.01-sigma resolution on the continuous parameters in the fine stage.
+    # LEAN coarse grid -- tuned for the two-stage CTF search:
+    #   coarse = 5 * 4 * 4 * 4 = 320 combos (was 9504 = 30x reduction)
+    # The fine stage (--ctf) automatically interpolates between the top
+    # coarse values, so density is only needed on the continuous params.
+    # Use --ctf-n-interp 8 to reach 0.125-sigma resolution in stage 2;
+    # --ctf-n-interp 24 for 0.05-sigma resolution.
     PARAM_SPEC: Dict[str, Dict[str, Any]] = {
         "entry_sigma": {
             "type": "float",
-            "grid": [round(1.00 + 0.25 * i, 2) for i in range(9)],
+            # 1.0, 1.5, 2.0, 2.5, 3.0 -> 5 values (0.5 sigma step)
+            "grid": [1.0, 1.5, 2.0, 2.5, 3.0],
         },
         "sigma_gap": {
             "type": "float",
-            "grid": [round(0.25 + 0.25 * i, 2) for i in range(12)],
+            # 0.5, 1.0, 1.5, 2.0 -> 4 values (covers 25-100% of entry_sigma)
+            "grid": [0.5, 1.0, 1.5, 2.0],
         },
         "max_hold_ticks": {
             "type": "int",
-            "grid": [10, 25, 50, 100, 150, 200, 300, 500, 750, 1000, 2000],
+            # 50, 100, 200, 500 -> 4 values (geometric spacing).  Values
+            # above max_ticks are auto-capped by the backtester, so no
+            # need to include 1000+.
+            "grid": [50, 100, 200, 500],
         },
         "window": {
             "type": "int",
-            "grid": [10, 25, 50, 100, 150, 200, 300, 500],
+            # 20, 50, 100, 200 -> 4 values.  Short windows catch tight
+            # mean-reverters (RAINFOREST_RESIN), longer for drift-heavy
+            # products.  Values >= max_ticks are auto-clamped.
+            "grid": [20, 50, 100, 200],
         },
     }
 
