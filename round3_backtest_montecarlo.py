@@ -427,10 +427,17 @@ def simulate_fills_one_tick(
     fills : list of FillResult (signed quantity from the trader's perspective)
     position_delta : per-product signed delta
     """
+    # Fast path: the vast majority of ticks in a mean-reverter or market-
+    # making trader return no orders. Avoid all per-tick setup in that case.
+    if not orders_by_product:
+        return [], {}
+
     all_fills: List[FillResult] = []
     delta: Dict[str, int] = defaultdict(int)
 
     for prod, orders in orders_by_product.items():
+        if not orders:
+            continue
         pos_now = position.get(prod, 0)
         limit = position_limits.get(prod, DEFAULT_POSITION_LIMIT)
 
@@ -1597,15 +1604,13 @@ def run_backtest_on_series(
             inventory_series.append(sum(abs(v) for v in position.values()))
     else:
         FILL_MODE = "APPROX"
-        # Build a synthetic order book from the mid series.
+        # --- Pre-compute: forward-fill NaNs, build float64 matrices once. ---
         products = list(mids_by_product.keys())
-        # Filter NaNs per product.
         clean: Dict[str, np.ndarray] = {}
         for p in products:
-            arr = np.asarray(mids_by_product[p], dtype=float)
+            arr = np.asarray(mids_by_product[p], dtype=np.float64)
             if arr.size == 0 or np.all(np.isnan(arr)):
                 continue
-            # Forward-fill NaNs.
             mask = np.isnan(arr)
             if mask.any():
                 idx = np.where(~mask, np.arange(len(arr)), 0)
@@ -1616,19 +1621,50 @@ def run_backtest_on_series(
         T = min(len(clean[p]) for p in products) if products else 0
         if max_ticks is not None and max_ticks > 0:
             T = min(T, max_ticks)
+
+        # Stack into a (P, T) matrix so per-tick MTM becomes a single dot
+        # product instead of a Python-level sum over a generator.
+        if products and T > 0:
+            mid_mat = np.vstack([clean[p][:T] for p in products])  # (P, T)
+            bid_mat = np.floor(mid_mat - 1.0).astype(np.int64)
+            ask_mat = np.ceil(mid_mat + 1.0).astype(np.int64)
+        else:
+            mid_mat = np.zeros((0, 0))
+            bid_mat = ask_mat = np.zeros((0, 0), dtype=np.int64)
+
+        # Fast position array kept aligned with ``products``; dict view is
+        # rebuilt lazily only when the trader is invoked.
+        prod_idx = {p: i for i, p in enumerate(products)}
+        pos_arr = np.zeros(len(products), dtype=np.int64)
+        # Initialise from any pre-set positions (normally empty).
+        for p, v in position.items():
+            if p in prod_idx:
+                pos_arr[prod_idx[p]] = v
+
+        # Reusable OrderDepth instances -- avoid re-instantiating 1.4M times.
+        depth_pool: Dict[str, OrderDepth] = {p: OrderDepth() for p in products}
+
         for t in range(T):
+            # Update the depth pool in place (single level per side).
             depths: Dict[str, OrderDepth] = {}
-            for p in products:
-                m = float(clean[p][t])
-                if not math.isfinite(m):
+            for pi, p in enumerate(products):
+                m = mid_mat[pi, t]
+                if not np.isfinite(m):
                     continue
-                od = OrderDepth()
-                od.buy_orders[int(math.floor(m - 1))] = 30
-                od.sell_orders[int(math.ceil(m + 1))] = -30
+                od = depth_pool[p]
+                od.buy_orders.clear()
+                od.sell_orders.clear()
+                od.buy_orders[int(bid_mat[pi, t])] = 30
+                od.sell_orders[int(ask_mat[pi, t])] = -30
                 depths[p] = od
-            nm = {
-                p: (float(clean[p][t + 1]) if t + 1 < T else None) for p in products
-            }
+
+            # Next-mid lookup as ndarray slice (avoid per-product dict comp).
+            if t + 1 < T:
+                nm_vec = mid_mat[:, t + 1]
+                nm = {p: float(nm_vec[pi]) for pi, p in enumerate(products)}
+            else:
+                nm = {p: None for p in products}
+
             state = TradingState(
                 traderData=traderData,
                 timestamp=t * TICK_STEP,
@@ -1636,7 +1672,7 @@ def run_backtest_on_series(
                 order_depths=depths,
                 own_trades={},
                 market_trades={},
-                position=dict(position),
+                position={p: int(pos_arr[prod_idx[p]]) for p in products},
                 observations=Observation(),
             )
             try:
@@ -1647,18 +1683,32 @@ def run_backtest_on_series(
                     orders_out = res if isinstance(res, dict) else {}
             except Exception:
                 orders_out = {}
-            fills, delta = simulate_fills_one_tick(
-                orders_out, depths, dict(position), position_limits, nm, t * TICK_STEP, "APPROX"
-            )
-            for f in fills:
-                _apply_fill(f.product, f.quantity, f.price)
-                cash -= f.price * f.quantity
-                turnover += abs(f.price * f.quantity)
-                position[f.product] += f.quantity
-            n_fills += len(fills)
-            mtm = sum(position.get(p, 0) * float(clean[p][t]) for p in products)
+            # Only run full matching when the trader actually submitted orders.
+            if orders_out:
+                fills, _delta = simulate_fills_one_tick(
+                    orders_out, depths,
+                    {p: int(pos_arr[prod_idx[p]]) for p in products},
+                    position_limits, nm, t * TICK_STEP, "APPROX",
+                )
+                for f in fills:
+                    _apply_fill(f.product, f.quantity, f.price)
+                    cash -= f.price * f.quantity
+                    turnover += abs(f.price * f.quantity)
+                    pi = prod_idx.get(f.product)
+                    if pi is not None:
+                        pos_arr[pi] += f.quantity
+                    else:
+                        position[f.product] = position.get(f.product, 0) + f.quantity
+                n_fills += len(fills)
+
+            # Vectorised MTM and inventory across products.
+            mtm = float(np.dot(pos_arr, mid_mat[:, t]))
             realized_pnl_path.append(cash + mtm)
-            inventory_series.append(sum(abs(v) for v in position.values()))
+            inventory_series.append(int(np.abs(pos_arr).sum()))
+
+        # Sync final position dict for any downstream use.
+        for pi, p in enumerate(products):
+            position[p] = int(pos_arr[pi])
 
     pnl = np.array(realized_pnl_path) if realized_pnl_path else np.array([0.0])
     final_pnl = float(pnl[-1])
@@ -2459,20 +2509,30 @@ def run_pipeline(
     print(f"[INFO] inferred position limits: {position_limits}")
 
     # -- Historical depths (EXACT fill when possible).
-    historical_depths = prices_to_order_depths(prices_df)
-    ordered_keys_all = sorted(historical_depths.keys())
-    # By default restrict EXACT mode to ``exact_days`` days (much faster).
-    ordered_keys = _single_day_keys(ordered_keys_all, exact_days)
-    if max_ticks is not None and max_ticks > 0 and len(ordered_keys) > max_ticks:
-        ordered_keys = ordered_keys[:max_ticks]
-    have_exact = len(ordered_keys) > 1 and any(
-        any(d.buy_orders or d.sell_orders for d in historical_depths.get(k, {}).values())
-        for k in ordered_keys
-    )
-    print(
-        f"[INFO] EXACT-fill: available={have_exact} keys={len(ordered_keys)} "
-        f"(of {len(ordered_keys_all)}) exact_days={exact_days} max_ticks={max_ticks}"
-    )
+    # Skip the expensive prices_to_order_depths build (~18s for 90k rows)
+    # when EXACT mode is disabled (exact_days=0 or skip_hist_in_grid=True
+    # with no final historical leg).
+    if exact_days <= 0:
+        historical_depths = {}
+        ordered_keys_all = []
+        ordered_keys = []
+        have_exact = False
+        print("[INFO] EXACT-fill: disabled (exact_days=0, skipping depth build)")
+    else:
+        historical_depths = prices_to_order_depths(prices_df)
+        ordered_keys_all = sorted(historical_depths.keys())
+        # By default restrict EXACT mode to ``exact_days`` days (much faster).
+        ordered_keys = _single_day_keys(ordered_keys_all, exact_days)
+        if max_ticks is not None and max_ticks > 0 and len(ordered_keys) > max_ticks:
+            ordered_keys = ordered_keys[:max_ticks]
+        have_exact = len(ordered_keys) > 1 and any(
+            any(d.buy_orders or d.sell_orders for d in historical_depths.get(k, {}).values())
+            for k in ordered_keys
+        )
+        print(
+            f"[INFO] EXACT-fill: available={have_exact} keys={len(ordered_keys)} "
+            f"(of {len(ordered_keys_all)}) exact_days={exact_days} max_ticks={max_ticks}"
+        )
 
     # -- Trader.
     trader_cls = load_external_trader(trader_path) if trader_path else None
