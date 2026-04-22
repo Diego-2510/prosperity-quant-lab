@@ -1172,6 +1172,39 @@ def run_backtest_on_series(
     inventory_series: List[float] = []
     n_fills = 0
     traderData = ""
+    # Per-product running average entry price for round-trip attribution.
+    # A round-trip closes when a fill reduces |position| for that product;
+    # the realised PnL on the reduced lot (= (exit - avg_entry) * closed_qty,
+    # signed by the direction of the old position) is recorded. Position
+    # flips through zero are split into a closing lot and a new opening lot.
+    avg_entry: Dict[str, float] = defaultdict(float)
+    round_trip_pnls: List[float] = []
+
+    def _apply_fill(product: str, qty: int, price: float) -> None:
+        """Update avg_entry and append realised PnL to round_trip_pnls.
+        ``qty`` uses Prosperity's sign convention: +buy / -sell.
+        """
+        old_pos = position[product]
+        new_pos = old_pos + qty
+        # Case 1: opening or adding to an existing position (same sign).
+        if old_pos == 0 or (old_pos > 0 and qty > 0) or (old_pos < 0 and qty < 0):
+            total_cost = avg_entry[product] * abs(old_pos) + price * abs(qty)
+            avg_entry[product] = total_cost / max(abs(new_pos), 1)
+            return
+        # Case 2: closing or partially closing (opposite sign).
+        close_qty = min(abs(qty), abs(old_pos))
+        # Sign of realised PnL: long closed by a sell -> (price - avg_entry),
+        # short closed by a buy -> (avg_entry - price).
+        direction = 1 if old_pos > 0 else -1
+        pnl = direction * (price - avg_entry[product]) * close_qty
+        round_trip_pnls.append(float(pnl))
+        # Case 3: fill flips through zero -> remaining qty opens a new lot.
+        remaining = abs(qty) - close_qty
+        if remaining > 0:
+            avg_entry[product] = price
+        elif new_pos == 0:
+            avg_entry[product] = 0.0
+        # else: partial close, avg_entry on the residual stays the same.
 
     if historical_depths is not None and ordered_keys is not None and len(ordered_keys) > 1:
         FILL_MODE = "EXACT"
@@ -1219,6 +1252,7 @@ def run_backtest_on_series(
                 orders_out, depths, dict(position), position_limits, next_mid_cache[i], ts, "EXACT"
             )
             for f in fills:
+                _apply_fill(f.product, f.quantity, f.price)
                 cash -= f.price * f.quantity  # buy reduces cash
                 turnover += abs(f.price * f.quantity)
                 position[f.product] += f.quantity
@@ -1289,6 +1323,7 @@ def run_backtest_on_series(
                 orders_out, depths, dict(position), position_limits, nm, t * TICK_STEP, "APPROX"
             )
             for f in fills:
+                _apply_fill(f.product, f.quantity, f.price)
                 cash -= f.price * f.quantity
                 turnover += abs(f.price * f.quantity)
                 position[f.product] += f.quantity
@@ -1301,12 +1336,20 @@ def run_backtest_on_series(
     final_pnl = float(pnl[-1])
     returns = np.diff(pnl, prepend=0.0)
     max_dd = float((np.maximum.accumulate(pnl) - pnl).max()) if len(pnl) else 0.0
+    # Active hit-rate: share of CLOSED round-trips that ended profitable.
+    # hit_rate (tick-based, returns>0) is diluted by idle ticks with zero PnL;
+    # hit_rate_active ignores them and answers "when I actually finish a
+    # round-trip, how often do I win?" -- a much better edge diagnostic.
+    rt = np.asarray(round_trip_pnls, dtype=float)
+    hit_rate_active = float((rt > 0).mean()) if rt.size else 0.0
     return dict(
         final_pnl=final_pnl,
         mean_step_pnl=float(returns.mean()) if len(returns) else 0.0,
         std_step_pnl=float(returns.std()) if len(returns) > 1 else 0.0,
         max_drawdown=max_dd,
         hit_rate=float((returns > 0).mean()) if len(returns) else 0.0,
+        hit_rate_active=hit_rate_active,
+        n_round_trips=int(rt.size),
         turnover=float(turnover),
         inventory_std=float(np.std(inventory_series)) if inventory_series else 0.0,
         n_trades=int(n_fills),
@@ -1523,6 +1566,7 @@ def _eval_combo_worker(
             )
         else:
             hist_res = dict(final_pnl=0.0, max_drawdown=0.0, hit_rate=0.0,
+                            hit_rate_active=0.0, n_round_trips=0,
                             turnover=0.0, inventory_std=0.0, equity_curve=[0.0])
 
         products = list(mc_paths.keys())
@@ -1530,6 +1574,8 @@ def _eval_combo_worker(
         trade_counts: List[int] = []
         drawdowns: List[float] = []
         hit_rates: List[float] = []
+        hit_rates_active: List[float] = []
+        round_trips: List[int] = []
         turnovers: List[float] = []
         inv_stds: List[float] = []
         rng = np.random.default_rng(seed + hash(tuple(sorted(params.items()))) % 2**31)
@@ -1551,6 +1597,8 @@ def _eval_combo_worker(
             # row reported 0.0 for drawdown / hit-rate / turnover / inv_std.
             drawdowns.append(float(r.get("max_drawdown", 0.0)))
             hit_rates.append(float(r.get("hit_rate", 0.0)))
+            hit_rates_active.append(float(r.get("hit_rate_active", 0.0)))
+            round_trips.append(int(r.get("n_round_trips", 0)))
             turnovers.append(float(r.get("turnover", 0.0)))
             inv_stds.append(float(r.get("inventory_std", 0.0)))
 
@@ -1564,6 +1612,8 @@ def _eval_combo_worker(
         m.update(dict(
             max_drawdown=_mean(drawdowns) if drawdowns else hist_res["max_drawdown"],
             hit_rate=_mean(hit_rates) if hit_rates else hist_res["hit_rate"],
+            hit_rate_active=_mean(hit_rates_active) if hit_rates_active else hist_res.get("hit_rate_active", 0.0),
+            mean_round_trips_per_path=_mean(round_trips) if round_trips else float(hist_res.get("n_round_trips", 0.0)),
             turnover=_mean(turnovers) if turnovers else hist_res["turnover"],
             inventory_std=_mean(inv_stds) if inv_stds else hist_res["inventory_std"],
             max_drawdown_worst=float(np.max(drawdowns)) if drawdowns else 0.0,
@@ -1756,7 +1806,8 @@ def pick_top2_robust(full_results: pd.DataFrame, metric: str = "sharpe") -> pd.D
             "objective_score", "obj_norm", "total_profit", "mean_profit", "median_profit",
             "profit_std", "variance", "VaR_5", "CVaR_5", "worst_path_profit", "max_drawdown",
             "max_drawdown_worst", "turnover_per_trade",
-            "hit_rate", "turnover", "inventory_std",
+            "hit_rate", "hit_rate_active", "mean_round_trips_per_path",
+            "turnover", "inventory_std",
             "sharpe", "profit_per_trade", "mean_trades_per_path", "median_trades_per_path",
             "n_trades", "historical_final_pnl", "n_eval_paths",
         } and pd.api.types.is_numeric_dtype(df[c])
