@@ -1528,6 +1528,10 @@ def _eval_combo_worker(
         products = list(mc_paths.keys())
         profits: List[float] = []
         trade_counts: List[int] = []
+        drawdowns: List[float] = []
+        hit_rates: List[float] = []
+        turnovers: List[float] = []
+        inv_stds: List[float] = []
         rng = np.random.default_rng(seed + hash(tuple(sorted(params.items()))) % 2**31)
         n_eval_eff = max(1, min(n_paths, n_eval))
         idx = rng.choice(n_paths, size=n_eval_eff, replace=False)
@@ -1541,15 +1545,29 @@ def _eval_combo_worker(
             )
             profits.append(r["final_pnl"])
             trade_counts.append(r["n_trades"])
+            # Per-path risk / activity metrics -- aggregated across MC paths
+            # below. Previously these were taken ONLY from hist_res, which is
+            # zeroed-out in grid mode (skip_hist_in_grid=True), so every grid
+            # row reported 0.0 for drawdown / hit-rate / turnover / inv_std.
+            drawdowns.append(float(r.get("max_drawdown", 0.0)))
+            hit_rates.append(float(r.get("hit_rate", 0.0)))
+            turnovers.append(float(r.get("turnover", 0.0)))
+            inv_stds.append(float(r.get("inventory_std", 0.0)))
 
         profits_arr = np.array(profits)
         trades_arr = np.array(trade_counts)
         m = aggregate_path_metrics(profits_arr, risk_lambda, per_path_trades=trades_arr)
+        # Prefer MC-path aggregates when the historical backtest was skipped
+        # (grid mode). Fall back to hist_res only if no MC paths executed.
+        def _mean(xs: List[float]) -> float:
+            return float(np.mean(xs)) if xs else 0.0
         m.update(dict(
-            max_drawdown=hist_res["max_drawdown"],
-            hit_rate=hist_res["hit_rate"],
-            turnover=hist_res["turnover"],
-            inventory_std=hist_res["inventory_std"],
+            max_drawdown=_mean(drawdowns) if drawdowns else hist_res["max_drawdown"],
+            hit_rate=_mean(hit_rates) if hit_rates else hist_res["hit_rate"],
+            turnover=_mean(turnovers) if turnovers else hist_res["turnover"],
+            inventory_std=_mean(inv_stds) if inv_stds else hist_res["inventory_std"],
+            max_drawdown_worst=float(np.max(drawdowns)) if drawdowns else 0.0,
+            turnover_per_trade=(_mean(turnovers) / _mean(trade_counts)) if _mean(trade_counts) > 0 else 0.0,
             historical_final_pnl=hist_res["final_pnl"],
             n_eval_paths=n_eval_eff,
         ))
@@ -1737,6 +1755,7 @@ def pick_top2_robust(full_results: pd.DataFrame, metric: str = "sharpe") -> pd.D
         if c not in {
             "objective_score", "obj_norm", "total_profit", "mean_profit", "median_profit",
             "profit_std", "variance", "VaR_5", "CVaR_5", "worst_path_profit", "max_drawdown",
+            "max_drawdown_worst", "turnover_per_trade",
             "hit_rate", "turnover", "inventory_std",
             "sharpe", "profit_per_trade", "mean_trades_per_path", "median_trades_per_path",
             "n_trades", "historical_final_pnl", "n_eval_paths",
