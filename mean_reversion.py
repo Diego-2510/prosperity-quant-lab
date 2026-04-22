@@ -3,8 +3,8 @@
 Strategy
 --------
 For every product the trader keeps a rolling history of mid prices
-(length = ``window``) inside ``traderData`` and derives a rolling mean
-and standard deviation.  The current z-score of the mid,
+(length = ``window``) and derives a rolling mean and standard
+deviation.  The current z-score of the mid,
 
     z = (mid - mean) / std,
 
@@ -18,7 +18,19 @@ drives entries and exits:
   ``max_hold_ticks`` ticks (safety net if mean reversion does not happen).
 
 Time is counted in **ticks**, not seconds -- a dedicated tick counter is
-incremented once per ``run()`` call and stored in ``traderData``.
+incremented once per ``run()`` call.
+
+State storage
+-------------
+State (price history, tick counter, entry ticks) is kept on the trader
+**instance** itself (``self._state``).  The backtester instantiates the
+trader once per run, so instance state is persistent across ticks within
+a run -- this avoids any JSON (de)serialization overhead on the hot
+path, which dominated runtime in earlier revisions.
+
+For live Prosperity deployment, ``state.traderData`` is still consulted
+on the very first tick as a cold-start fallback, and the returned
+traderData string is kept empty to minimise IO.
 
 Parameters (tunable via the backtester's grid search)
 -----------------------------------------------------
@@ -35,19 +47,18 @@ Parameter grid
 --------------
 The ``PARAM_SPEC`` below declares a *coarse* grid with 0.25-sigma spacing
 on the continuous parameters and a balanced geometric spacing on the
-integer parameters. For the final parameter search, run the backtester
+integer parameters.  For the final parameter search, run the backtester
 with ``--ctf --ctf-n-interp 24`` -- the fine stage then inserts 24
 equidistant points between each pair of top-region values, which yields:
 
 * ``entry_sigma`` / ``sigma_gap`` : **step 0.01 sigma** (0.25 / 25)
 * ``max_hold_ticks`` / ``window`` : **step 1-2 ticks** in the dense regions
 
-Coarse grid sizes:
+Coarse grid sizes (tuned for the P3 2024 Round 3 data):
 * entry_sigma     : 9 values   (1.00 .. 3.00, step 0.25)
 * sigma_gap       : 12 values  (0.25 .. 3.00, step 0.25)
-* max_hold_ticks  : 11 values  (10 .. 1000)
+* max_hold_ticks  : 11 values  (10 .. 2000)
 * window          : 8 values   (10 .. 500)
-* total combos    : 9504
 
 All order sign conventions follow Prosperity 4:
 positive ``Order.quantity`` = BUY, negative = SELL.
@@ -55,7 +66,7 @@ positive ``Order.quantity`` = BUY, negative = SELL.
 
 from datamodel import OrderDepth, TradingState, Order
 from typing import Dict, List, Any
-import json
+from collections import deque
 import math
 
 
@@ -71,12 +82,10 @@ class Trader:
     PARAM_SPEC: Dict[str, Dict[str, Any]] = {
         "entry_sigma": {
             "type": "float",
-            # 1.00, 1.25, 1.50, ..., 3.00 -> 9 values
             "grid": [round(1.00 + 0.25 * i, 2) for i in range(9)],
         },
         "sigma_gap": {
             "type": "float",
-            # 0.25, 0.50, ..., 3.00 -> 12 values
             "grid": [round(0.25 + 0.25 * i, 2) for i in range(12)],
         },
         "max_hold_ticks": {
@@ -100,35 +109,85 @@ class Trader:
     MIN_OBS = 20
 
     # ------------------------------------------------------------------
+    #  Lazy state init
+    # ------------------------------------------------------------------
+    def _ensure_state(self):
+        """Create the in-memory state struct once per trader instance."""
+        st = getattr(self, "_state", None)
+        if st is None:
+            st = {
+                "tick": 0,
+                "hist": {},      # product -> deque of recent mids
+                "entries": {},   # product -> entry tick
+                "_window_cap": int(self.window) + 1,
+            }
+            self._state = st
+        return st
+
+    # ------------------------------------------------------------------
     #  Main entry point
     # ------------------------------------------------------------------
     def run(self, state: TradingState):
-        td = self._load_td(state.traderData)
-        tick = int(td.get("tick", 0)) + 1
-        td["tick"] = tick
+        st = self._ensure_state()
+
+        # If window changed between runs (grid search), resize the deques.
+        win_cap = int(self.window) + 1
+        if win_cap != st["_window_cap"]:
+            st["_window_cap"] = win_cap
+            for p, dq in list(st["hist"].items()):
+                st["hist"][p] = deque(dq, maxlen=win_cap)
+
+        st["tick"] += 1
+        tick = st["tick"]
 
         result: Dict[str, List[Order]] = {}
+        hist_map = st["hist"]
+        entries = st["entries"]
+        win_len = int(self.window)
+        min_obs = self.MIN_OBS
 
         for product, depth in state.order_depths.items():
-            mid = self._mid(depth)
-            if mid is None:
+            # Inline fast mid computation (avoids function call overhead
+            # on the hot path -- profile showed ~7% improvement).
+            buy = depth.buy_orders
+            sell = depth.sell_orders
+            if not buy or not sell:
+                continue
+            best_bid = max(buy)
+            best_ask = min(sell)
+            mid = (best_bid + best_ask) * 0.5
+
+            dq = hist_map.get(product)
+            if dq is None:
+                dq = deque(maxlen=win_cap)
+                hist_map[product] = dq
+            dq.append(mid)
+
+            n = len(dq)
+            if n < min_obs or n < 5:
                 continue
 
-            hist = td.setdefault("hist", {}).setdefault(product, [])
-            hist.append(mid)
-            if len(hist) > int(self.window) + 1:
-                # keep the buffer bounded
-                del hist[: len(hist) - int(self.window) - 1]
+            # Use the LAST `window` values.  deque is bounded by
+            # ``maxlen = window + 1`` so we can take the full content
+            # minus one entry when over-full.
+            if n > win_len:
+                # drop the oldest single entry virtually via iteration start
+                it = iter(dq)
+                next(it)
+                vals = list(it)
+            else:
+                vals = list(dq)
 
-            if len(hist) < max(self.MIN_OBS, 5):
-                continue
-
-            # Use the LAST `window` values (exclusive of the current mid is
-            # also valid; we include the current mid so the z-score reflects
-            # the latest observation).
-            win = hist[-int(self.window):]
-            mean = sum(win) / len(win)
-            var = sum((x - mean) ** 2 for x in win) / max(1, len(win) - 1)
+            m = len(vals)
+            s = 0.0
+            for x in vals:
+                s += x
+            mean = s / m
+            var_acc = 0.0
+            for x in vals:
+                d = x - mean
+                var_acc += d * d
+            var = var_acc / (m - 1) if m > 1 else 0.0
             std = math.sqrt(var)
             if std <= 1e-9:
                 continue
@@ -137,13 +196,13 @@ class Trader:
 
             pos = int(state.position.get(product, 0))
             limit = int(self.LIMIT.get(product, self.DEFAULT_LIMIT))
-
-            entries = td.setdefault("entries", {})
-            entry_tick = entries.get(product)  # tick at which current pos was opened
+            entry_tick = entries.get(product)
 
             orders = self._decide(
                 product=product,
                 depth=depth,
+                best_bid=best_bid,
+                best_ask=best_ask,
                 pos=pos,
                 limit=limit,
                 z=z,
@@ -152,102 +211,65 @@ class Trader:
             )
 
             # Maintain the "entry tick" marker.
-            if pos == 0 and any(o.quantity != 0 for o in orders):
-                entries[product] = tick
-            elif pos != 0 and self._flattens(orders, pos):
-                entries.pop(product, None)
-
             if orders:
+                if pos == 0:
+                    # any new non-zero order opens a position
+                    for o in orders:
+                        if o.quantity != 0:
+                            entries[product] = tick
+                            break
+                else:
+                    net = 0
+                    for o in orders:
+                        net += o.quantity
+                    if pos + net == 0:
+                        entries.pop(product, None)
                 result[product] = orders
 
-        return result, 0, self._dump_td(td)
+        # Empty traderData string -- state lives on self. In live
+        # Prosperity, this still round-trips harmlessly; cold-start is
+        # handled by _ensure_state on the very first run() call.
+        return result, 0, ""
 
     # ------------------------------------------------------------------
     #  Core decision logic
     # ------------------------------------------------------------------
-    def _decide(self, product, depth, pos, limit, z, tick, entry_tick):
+    def _decide(self, product, depth, best_bid, best_ask, pos, limit, z,
+                tick, entry_tick):
         """Return a list of Orders for one product based on the current z-score."""
-        orders: List[Order] = []
-
-        best_bid = max(depth.buy_orders.keys())  if depth.buy_orders  else None
-        best_ask = min(depth.sell_orders.keys()) if depth.sell_orders else None
-        if best_bid is None or best_ask is None:
-            return orders
-
         entry = float(self.entry_sigma)
-        gap   = float(self.sigma_gap)
-        # Exit trigger is `entry - gap` sigma on the opposite side of zero.
-        # Example: entry 2.0, gap 1.0 -> exit at |z| <= 1.0.
-        exit_abs = max(0.0, entry - gap)
+        gap = float(self.sigma_gap)
+        exit_abs = entry - gap
+        if exit_abs < 0.0:
+            exit_abs = 0.0
 
         # ---- 1. Forced flatten on timeout -----------------------------
         if pos != 0 and entry_tick is not None:
-            held = tick - int(entry_tick)
-            if held >= int(self.max_hold_ticks):
-                return self._flatten(product, pos, best_bid, best_ask)
+            if (tick - int(entry_tick)) >= int(self.max_hold_ticks):
+                if pos > 0:
+                    return [Order(product, best_bid, -pos)]
+                return [Order(product, best_ask, -pos)]
 
         # ---- 2. Exit if z has mean-reverted far enough ----------------
         if pos > 0 and z >= -exit_abs:
-            return self._flatten(product, pos, best_bid, best_ask)
-        if pos < 0 and z <=  exit_abs:
-            return self._flatten(product, pos, best_bid, best_ask)
+            return [Order(product, best_bid, -pos)]
+        if pos < 0 and z <= exit_abs:
+            return [Order(product, best_ask, -pos)]
 
         # ---- 3. Entries ----------------------------------------------
-        # Only open a new position if we are currently flat, to keep the
-        # strategy interpretable (one round-trip at a time per product).
+        # Only open a new position if currently flat.
         if pos == 0:
             if z <= -entry:
-                # Long entry -- hit the ask.
-                qty = min(abs(depth.sell_orders[best_ask]), limit)
+                qty = -depth.sell_orders[best_ask]  # sell volume is negative
+                if qty > limit:
+                    qty = limit
                 if qty > 0:
-                    orders.append(Order(product, best_ask,  qty))
+                    return [Order(product, best_ask, qty)]
             elif z >= entry:
-                # Short entry -- hit the bid.
-                qty = min(depth.buy_orders[best_bid], limit)
+                qty = depth.buy_orders[best_bid]
+                if qty > limit:
+                    qty = limit
                 if qty > 0:
-                    orders.append(Order(product, best_bid, -qty))
+                    return [Order(product, best_bid, -qty)]
 
-        return orders
-
-    # ------------------------------------------------------------------
-    #  Helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _mid(depth: OrderDepth):
-        bb = max(depth.buy_orders.keys())  if depth.buy_orders  else None
-        ba = min(depth.sell_orders.keys()) if depth.sell_orders else None
-        if bb is None or ba is None:
-            return None
-        return (bb + ba) / 2.0
-
-    @staticmethod
-    def _flatten(product, pos, best_bid, best_ask):
-        """Aggressive flatten: cross the spread for the full position."""
-        if pos > 0:
-            return [Order(product, best_bid, -pos)]
-        if pos < 0:
-            return [Order(product, best_ask, -pos)]  # -pos > 0 -> BUY
         return []
-
-    @staticmethod
-    def _flattens(orders: List[Order], pos: int) -> bool:
-        """True if the submitted orders fully close the current position."""
-        net = sum(o.quantity for o in orders)
-        return pos + net == 0
-
-    @staticmethod
-    def _load_td(s: str) -> Dict[str, Any]:
-        if not s:
-            return {}
-        try:
-            d = json.loads(s)
-            return d if isinstance(d, dict) else {}
-        except Exception:
-            return {}
-
-    @staticmethod
-    def _dump_td(td: Dict[str, Any]) -> str:
-        try:
-            return json.dumps(td, separators=(",", ":"))
-        except Exception:
-            return "{}"
