@@ -825,6 +825,288 @@ def generate_monte_carlo_paths(
     return out
 
 
+# -----------------------------------------------------------------------------
+# 7b. ORNSTEIN-UHLENBECK PATH GENERATION + CALIBRATION DIAGNOSTICS
+# -----------------------------------------------------------------------------
+#
+# The block-bootstrap above reshuffles historical returns, which preserves
+# empirical marginal distributions but assumes no parametric structure. For
+# products that mean-revert around a long-run level (a spread, a
+# calibrated fair value, etc.) an Ornstein-Uhlenbeck model is a closer fit:
+#
+#     dS_t = theta * (mu - S_t) * dt + sigma * dW_t
+#
+# Discretised at unit dt the exact transition is
+#
+#     S_{t+1} = mu + (S_t - mu) * exp(-theta) + sigma_eff * eps,
+#     sigma_eff = sigma * sqrt((1 - exp(-2 theta)) / (2 theta))
+#
+# Calibration is AR(1) regression on lagged levels: regress (S_{t+1} - S_t)
+# on (S_t - mean); the slope is theta, residual std scales to sigma, and the
+# intercept pins mu. This is the maximum-likelihood estimator under Gaussian
+# shocks (Aït-Sahalia, 2002) and an order of magnitude faster than MLE for
+# our grid sizes.
+#
+# Validation diagnostics returned per product:
+#   - theta, mu, sigma (estimated)
+#   - half_life = log(2) / theta  (intuitive: ticks to close half the gap)
+#   - r2_ar1   (how well the AR(1) form actually fits)
+#   - adf_like (unit-root-ish statistic: theta / se(theta); >2 ~ reverting)
+#   - resid_std, resid_skew, resid_kurt  (Gaussianity check)
+#   - ljung_box_lag5_p  (whitening check on residuals)
+#   - mean_reversion_acf_decay  (1-step AC of centred level; should be < 1)
+#
+# The user can OVERRIDE any of theta / mu / sigma via CLI; unfurnished values
+# fall back to the calibrated estimate. A per-product override dict is
+# accepted as well (useful when Prosperity.txt gives a fair value for one
+# product but not others).
+
+
+def _ar1_fit(series: np.ndarray) -> Dict[str, float]:
+    """Fit an AR(1) mean-reverting process to a 1D level series and return
+    diagnostics alongside ``theta / mu / sigma``. Designed to be robust to
+    short / flat / NaN-containing input: returns safe defaults rather than
+    raising, so an unfittable product silently falls back to historical
+    mean + zero vol and will produce flat paths.
+    """
+    x = np.asarray(series, dtype=float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    base = dict(theta=0.0, mu=float(x.mean()) if n else 0.0, sigma=0.0,
+                half_life=float("inf"), r2_ar1=0.0, adf_like=0.0,
+                resid_std=0.0, resid_skew=0.0, resid_kurt=0.0,
+                ljung_box_lag5_p=float("nan"), mean_reversion_acf_decay=1.0,
+                n_obs=int(n))
+    if n < 10:
+        return base
+    # Difference regression: dx_t = alpha + beta * x_t + eps
+    x_lag = x[:-1]
+    dx = np.diff(x)
+    xm = x_lag.mean()
+    xl_c = x_lag - xm
+    denom = float(np.sum(xl_c ** 2))
+    if denom <= 0:
+        return base
+    beta = float(np.sum(xl_c * (dx - dx.mean())) / denom)
+    alpha = float(dx.mean() - beta * xm)
+    resid = dx - (alpha + beta * x_lag)
+    # theta from the continuous-time mapping beta = -(1 - exp(-theta)).
+    # Numerical guard: clip beta to (-1 + 1e-9, 0) before inverting.
+    beta_c = max(min(beta, -1e-9), -1 + 1e-9) if beta < 0 else 0.0
+    theta = -math.log(1 + beta_c) if beta_c < 0 else 0.0
+    mu = (-alpha / beta) if beta_c < 0 and beta != 0 else float(x.mean())
+    # Long-run sigma from sigma_eff (residual std of dx) via
+    # sigma_eff^2 = sigma^2 * (1 - exp(-2 theta)) / (2 theta).
+    sigma_eff = float(resid.std(ddof=1)) if len(resid) > 1 else 0.0
+    if theta > 1e-6:
+        factor = (1.0 - math.exp(-2.0 * theta)) / (2.0 * theta)
+        sigma = sigma_eff / math.sqrt(factor) if factor > 0 else sigma_eff
+    else:
+        sigma = sigma_eff  # driftless random walk limit
+    # Diagnostics.
+    ss_tot = float(np.sum((dx - dx.mean()) ** 2))
+    r2 = 1.0 - float(np.sum(resid ** 2)) / ss_tot if ss_tot > 0 else 0.0
+    # Standard error of beta; adf_like = -beta / se(beta). Large positive
+    # value means strong mean-reversion (mirrors ADF t-stat in spirit).
+    se_beta = math.sqrt(float(np.sum(resid ** 2)) / max(n - 2, 1) / denom)
+    adf_like = (-beta / se_beta) if se_beta > 0 else 0.0
+    # Residual higher moments.
+    rs = resid - resid.mean()
+    rsd = float(np.std(rs))
+    if rsd > 0:
+        skew = float(np.mean((rs / rsd) ** 3))
+        kurt = float(np.mean((rs / rsd) ** 4) - 3.0)
+    else:
+        skew = kurt = 0.0
+    # Ljung-Box at lag 5 on residuals (whitening check). Small p -> structure
+    # left over -> AR(1) is an incomplete fit.
+    try:
+        lags = 5
+        n_r = len(rs)
+        acfs = []
+        var_r = float(np.var(rs))
+        for k in range(1, lags + 1):
+            if n_r - k <= 0 or var_r <= 0:
+                break
+            ck = float(np.mean(rs[:-k] * rs[k:])) / var_r
+            acfs.append(ck)
+        if acfs:
+            q = n_r * (n_r + 2) * sum((a ** 2) / (n_r - k - 1)
+                                       for k, a in enumerate(acfs))
+            # Approximate chi-square tail probability via survival of gamma.
+            from math import gamma as _gamma
+            k_df = len(acfs)
+            # Use an upper-tail approximation (Wilson-Hilferty).
+            t = (q / k_df) ** (1 / 3)
+            m = 1 - 2 / (9 * k_df)
+            s = math.sqrt(2 / (9 * k_df))
+            z = (t - m) / s
+            lb_p = 0.5 * math.erfc(z / math.sqrt(2))
+        else:
+            lb_p = float("nan")
+    except Exception:
+        lb_p = float("nan")
+    # 1-lag ACF of centred level (should be < 1 for reverting series).
+    xc = x - x.mean()
+    if n > 2 and float(np.var(xc)) > 0:
+        acf1 = float(np.mean(xc[:-1] * xc[1:])) / float(np.var(xc))
+    else:
+        acf1 = 1.0
+    half_life = (math.log(2) / theta) if theta > 1e-9 else float("inf")
+    return dict(theta=float(theta), mu=float(mu), sigma=float(sigma),
+                half_life=float(half_life), r2_ar1=float(r2),
+                adf_like=float(adf_like), resid_std=float(rsd),
+                resid_skew=float(skew), resid_kurt=float(kurt),
+                ljung_box_lag5_p=float(lb_p),
+                mean_reversion_acf_decay=float(acf1), n_obs=int(n))
+
+
+def calibrate_ou(
+    prices_df: pd.DataFrame,
+    overrides: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, Dict[str, float]]:
+    """Fit OU per product. ``overrides`` may supply user-specified
+    ``theta`` / ``mu`` / ``sigma`` per product; any key present wins over
+    the calibrated value. Returns a dict keyed by product with the fit
+    parameters plus all diagnostics (see :func:`_ar1_fit`).
+    """
+    overrides = overrides or {}
+    global_ov = overrides.get("__GLOBAL__", {})
+    out: Dict[str, Dict[str, float]] = {}
+    for prod, sub in prices_df.groupby("product"):
+        fit = _ar1_fit(sub["mid_price"].values)
+        # Global overrides apply first, per-product overrides win over those.
+        ov: Dict[str, float] = dict(global_ov)
+        ov.update(overrides.get(prod, {}))
+        # User overrides take precedence but leave diagnostics intact so
+        # the user can see how far their override is from the data.
+        for k in ("theta", "mu", "sigma"):
+            if k in ov and ov[k] is not None:
+                fit[f"{k}_calibrated"] = fit[k]
+                fit[k] = float(ov[k])
+        # Derived half-life reflects the effective theta actually used.
+        fit["half_life"] = (math.log(2) / fit["theta"]) if fit["theta"] > 1e-9 else float("inf")
+        out[prod] = fit
+    return out
+
+
+def generate_monte_carlo_paths_ou(
+    prices_df: pd.DataFrame,
+    n_paths: int = 1000,
+    seed: int = 42,
+    params: Optional[Dict[str, Dict[str, float]]] = None,
+    overrides: Optional[Dict[str, Dict[str, float]]] = None,
+    horizon: Optional[int] = None,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, float]]]:
+    """Generate mean-reverting paths from a calibrated OU process.
+
+    Returns ``(paths_by_product, calibration_diagnostics)``.
+
+    Shocks are drawn independently per product (no cross-asset coupling).
+    If that matters for your trader, stick with the bootstrap generator --
+    OU here is single-asset-parametric by design. Path length defaults to
+    the per-product historical length unless ``horizon`` is set.
+    """
+    if prices_df.empty:
+        return {}, {}
+    rng = np.random.default_rng(seed)
+    if params is None:
+        params = calibrate_ou(prices_df, overrides=overrides)
+    out: Dict[str, np.ndarray] = {}
+    for prod, fit in params.items():
+        sub = prices_df[prices_df["product"] == prod].sort_values(["day", "timestamp"])
+        levels = sub["mid_price"].values
+        levels = levels[np.isfinite(levels)]
+        T = int(horizon) if horizon is not None else int(len(levels))
+        if T <= 1 or len(levels) == 0:
+            out[prod] = np.zeros((n_paths, max(T, 1)))
+            continue
+        theta = float(fit["theta"])
+        mu = float(fit["mu"])
+        sigma = float(fit["sigma"])
+        # Exact transition moments (unit dt).
+        decay = math.exp(-theta) if theta > 0 else 1.0
+        if theta > 1e-9:
+            sigma_step = sigma * math.sqrt((1.0 - math.exp(-2.0 * theta)) / (2.0 * theta))
+        else:
+            sigma_step = sigma  # degenerate random-walk limit
+        arr = np.empty((n_paths, T), dtype=float)
+        arr[:, 0] = float(levels[0])
+        if sigma_step > 0 and T > 1:
+            eps = rng.standard_normal(size=(n_paths, T - 1))
+            # Vectorised recursion: S_{t+1} = mu + decay * (S_t - mu) + sigma_step * eps
+            for t in range(1, T):
+                arr[:, t] = mu + decay * (arr[:, t - 1] - mu) + sigma_step * eps[:, t - 1]
+        else:
+            arr[:, 1:] = arr[:, :1]
+        out[prod] = arr
+    return out, params
+
+
+def plot_ou_calibration(
+    prices_df: pd.DataFrame,
+    mc_paths: Dict[str, np.ndarray],
+    ou_params: Dict[str, Dict[str, float]],
+    out: Path,
+    n_overlay: int = 20,
+) -> None:
+    """3-panel validation plot PER product (stacked vertically):
+      1. historical level with long-run mean + +/-2 sigma band
+      2. overlay of ``n_overlay`` simulated paths on the same axes
+      3. histogram of simulated terminal levels vs. historical mean/std
+    Skips silently on error.
+    """
+    products = list(ou_params.keys())
+    if not products:
+        return
+    rows = len(products)
+    fig, axes = plt.subplots(rows, 3, figsize=(15, 3.2 * rows), squeeze=False)
+    for i, prod in enumerate(products):
+        ax_hist, ax_sim, ax_dist = axes[i]
+        sub = prices_df[prices_df["product"] == prod].sort_values(["day", "timestamp"])
+        hist = sub["mid_price"].values.astype(float)
+        hist = hist[np.isfinite(hist)]
+        fit = ou_params[prod]
+        mu = fit["mu"]
+        # Long-run std of an OU process: sigma / sqrt(2*theta).
+        if fit["theta"] > 1e-9:
+            lr_std = fit["sigma"] / math.sqrt(2.0 * fit["theta"])
+        else:
+            lr_std = float(np.std(hist)) if len(hist) else 0.0
+        # Panel 1: historical.
+        ax_hist.plot(hist, lw=0.7, color="black")
+        ax_hist.axhline(mu, color="red", lw=1.0, label=f"mu={mu:.2f}")
+        ax_hist.axhline(mu + 2 * lr_std, color="red", lw=0.6, ls="--",
+                        label=f"+/-2 sigma_lr ({lr_std:.2f})")
+        ax_hist.axhline(mu - 2 * lr_std, color="red", lw=0.6, ls="--")
+        ax_hist.set_title(f"{prod}: historical level")
+        ax_hist.legend(fontsize=8)
+        ax_hist.grid(alpha=0.3)
+        # Panel 2: simulated overlay.
+        paths = mc_paths.get(prod)
+        if paths is not None and paths.size:
+            k = min(n_overlay, paths.shape[0])
+            for j in range(k):
+                ax_sim.plot(paths[j], lw=0.4, alpha=0.6)
+            ax_sim.axhline(mu, color="red", lw=1.0)
+            ax_sim.set_title(
+                f"{prod}: {k} simulated paths  |  theta={fit['theta']:.4f}, "
+                f"half_life={fit['half_life']:.1f} ticks"
+            )
+            ax_sim.grid(alpha=0.3)
+            # Panel 3: terminal distribution.
+            term = paths[:, -1]
+            ax_dist.hist(term, bins=30, color="steelblue", alpha=0.8)
+            ax_dist.axvline(mu, color="red", lw=1.0, label=f"mu={mu:.2f}")
+            ax_dist.axvline(float(np.mean(hist)), color="black", lw=1.0, ls=":",
+                            label=f"hist mean={float(np.mean(hist)):.2f}")
+            ax_dist.set_title(f"{prod}: terminal level dist (n={len(term)})")
+            ax_dist.legend(fontsize=8)
+            ax_dist.grid(alpha=0.3)
+    fig.suptitle("OU calibration & simulation diagnostics", y=1.0, fontsize=12)
+    save_plot(fig, out)
+
+
 # =============================================================================
 # 8. PARAMETER REGISTRY + GRID SEARCH
 # =============================================================================
@@ -2059,6 +2341,8 @@ def run_pipeline(
     n_workers: int = -1,
     rank_metric: str = "sharpe",
     min_trades_filter: float = 5.0,
+    mc_method: str = "bootstrap",
+    ou_overrides: Optional[Dict[str, Dict[str, float]]] = None,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -2168,8 +2452,46 @@ def run_pipeline(
     print(f"[INFO] Parameter registry keys: {list(spec.keys())}")
 
     # -- Monte-Carlo paths (truncated to max_ticks if set).
-    print(f"[INFO] Generating {n_paths} Monte-Carlo paths ...")
-    mc_paths = generate_monte_carlo_paths(prices_df, n_paths=n_paths, seed=seed)
+    ou_params: Dict[str, Dict[str, float]] = {}
+    if mc_method == "ou":
+        print(f"[INFO] Generating {n_paths} Ornstein-Uhlenbeck paths ...")
+        mc_paths, ou_params = generate_monte_carlo_paths_ou(
+            prices_df, n_paths=n_paths, seed=seed,
+            overrides=ou_overrides, horizon=max_ticks,
+        )
+        # Print a readable calibration table.
+        print("[OU] per-product calibration & fit diagnostics:")
+        print(f"    {'product':<28s} {'theta':>8s} {'mu':>12s} {'sigma':>10s} "
+              f"{'half_life':>10s} {'r2_ar1':>8s} {'adf_like':>9s} "
+              f"{'acf1':>7s} {'n_obs':>7s}")
+        for p, fit in ou_params.items():
+            print(f"    {p:<28s} {fit['theta']:>8.4f} {fit['mu']:>12.4f} "
+                  f"{fit['sigma']:>10.4f} {fit['half_life']:>10.1f} "
+                  f"{fit['r2_ar1']:>8.3f} {fit['adf_like']:>9.2f} "
+                  f"{fit['mean_reversion_acf_decay']:>7.3f} {fit['n_obs']:>7d}")
+        # Flag questionable fits to the user explicitly.
+        for p, fit in ou_params.items():
+            warnings_found = []
+            if fit["adf_like"] < 2.0:
+                warnings_found.append(f"adf_like={fit['adf_like']:.2f} < 2.0 (weak reversion -- OU may overfit)")
+            if fit["r2_ar1"] < 0.01:
+                warnings_found.append(f"r2_ar1={fit['r2_ar1']:.3f} < 0.01 (AR(1) explains almost nothing)")
+            if fit["half_life"] > 10000:
+                warnings_found.append(f"half_life={fit['half_life']:.0f} huge (effective random walk)")
+            if abs(fit["resid_kurt"]) > 3:
+                warnings_found.append(f"resid_kurt={fit['resid_kurt']:.1f} (heavy-tailed innovations, Gaussian OU will understate jumps)")
+            if warnings_found:
+                print(f"[OU WARN] {p}: " + "; ".join(warnings_found))
+        # Persist the full calibration table for downstream inspection.
+        cal_rows = []
+        for p, fit in ou_params.items():
+            row = dict(product=p)
+            row.update({k: v for k, v in fit.items()})
+            cal_rows.append(row)
+        pd.DataFrame(cal_rows).to_csv(out_dir / "ou_calibration.csv", index=False)
+    else:
+        print(f"[INFO] Generating {n_paths} Monte-Carlo paths (bootstrap) ...")
+        mc_paths = generate_monte_carlo_paths(prices_df, n_paths=n_paths, seed=seed)
     if max_ticks is not None and max_ticks > 0:
         mc_paths = {p: arr[:, :max_ticks] for p, arr in mc_paths.items()}
     products = list(mc_paths.keys())
@@ -2181,8 +2503,17 @@ def run_pipeline(
             horizon=arr.shape[1],
             mean_final=float(arr[:, -1].mean()),
             std_final=float(arr[:, -1].std()),
+            method=mc_method,
         ))
     pd.DataFrame(mc_summary_rows).to_csv(out_dir / "monte_carlo_summary.csv", index=False)
+
+    # OU validation plot (historical + simulated + terminal distribution).
+    if mc_method == "ou" and ou_params:
+        try:
+            plot_ou_calibration(prices_df, mc_paths, ou_params,
+                                out_dir / "plot_ou_calibration.png")
+        except Exception as e:
+            print(f"[WARN] plot_ou_calibration failed: {e}")
 
     # -- Backtest-Runner (single param, over MC paths).
     T_path = min(arr.shape[1] for arr in mc_paths.values()) if mc_paths else 0
@@ -2435,7 +2766,68 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-trades-filter", type=float, default=5.0,
                     help="Drop configs with mean_trades_per_path < this value before "
                          "ranking and from the final output CSV. Default: 5.0.")
+    ap.add_argument("--mc-method", choices=["bootstrap", "ou"], default="bootstrap",
+                    help="Monte-Carlo generator: bootstrap (block+residual, default) "
+                         "or ou (Ornstein-Uhlenbeck, mean-reverting parametric).")
+    ap.add_argument("--ou-theta", type=float, default=None,
+                    help="OU mean-reversion speed (global default for every product; "
+                         "overridden by --ou-override).")
+    ap.add_argument("--ou-mu", type=float, default=None,
+                    help="OU long-run mean (global default for every product).")
+    ap.add_argument("--ou-sigma", type=float, default=None,
+                    help="OU volatility (global default for every product).")
+    ap.add_argument("--ou-override", action="append", default=[],
+                    help="Per-product OU override, format 'PRODUCT:theta=X,mu=Y,sigma=Z' "
+                         "(any subset of keys). Repeatable.")
     return ap.parse_args()
+
+
+def _parse_ou_overrides(global_theta: Optional[float],
+                        global_mu: Optional[float],
+                        global_sigma: Optional[float],
+                        override_strings: List[str]) -> Dict[str, Dict[str, float]]:
+    """Build OU override dict. Global values apply to every product key via the
+    special '__GLOBAL__' bucket (consumed by calibrate_ou). Per-product strings
+    (format 'PRODUCT:theta=X,mu=Y,sigma=Z') overlay those globals."""
+    overrides: Dict[str, Dict[str, float]] = {}
+    globals_dict: Dict[str, float] = {}
+    if global_theta is not None:
+        globals_dict["theta"] = float(global_theta)
+    if global_mu is not None:
+        globals_dict["mu"] = float(global_mu)
+    if global_sigma is not None:
+        globals_dict["sigma"] = float(global_sigma)
+    if globals_dict:
+        overrides["__GLOBAL__"] = globals_dict
+    for raw in override_strings or []:
+        if ":" not in raw:
+            print(f"[WARN] Ignoring --ou-override '{raw}': missing ':' (expected PRODUCT:k=v,...)")
+            continue
+        product, kvs = raw.split(":", 1)
+        product = product.strip()
+        if not product:
+            print(f"[WARN] Ignoring --ou-override '{raw}': empty product name")
+            continue
+        pdict: Dict[str, float] = {}
+        for kv in kvs.split(","):
+            kv = kv.strip()
+            if not kv:
+                continue
+            if "=" not in kv:
+                print(f"[WARN] Ignoring '{kv}' in --ou-override '{raw}' (expected k=v)")
+                continue
+            k, v = kv.split("=", 1)
+            k = k.strip().lower()
+            if k not in ("theta", "mu", "sigma"):
+                print(f"[WARN] Ignoring unknown key '{k}' in --ou-override '{raw}'")
+                continue
+            try:
+                pdict[k] = float(v)
+            except ValueError:
+                print(f"[WARN] Ignoring non-numeric '{kv}' in --ou-override '{raw}'")
+        if pdict:
+            overrides[product] = pdict
+    return overrides
 
 
 if __name__ == "__main__":
@@ -2462,6 +2854,10 @@ if __name__ == "__main__":
             n_workers=args.n_workers,
             rank_metric=args.rank_metric,
             min_trades_filter=args.min_trades_filter,
+            mc_method=args.mc_method,
+            ou_overrides=_parse_ou_overrides(
+                args.ou_theta, args.ou_mu, args.ou_sigma, args.ou_override,
+            ),
         )
     except Exception as e:
         traceback.print_exc()
