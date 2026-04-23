@@ -78,7 +78,7 @@ class Trader:
 
     # Grid-search parameter registry (picked up by the backtester).
     # LEAN coarse grid -- tuned for the two-stage CTF search:
-    #   coarse = 5 * 4 * 4 * 4 = 320 combos (was 9504 = 30x reduction)
+    #   coarse = 5 * 4 * 4 * 5 = 400 combos (was 9504 = 24x reduction)
     # The fine stage (--ctf) automatically interpolates between the top
     # coarse values, so density is only needed on the continuous params.
     # Use --ctf-n-interp 8 to reach 0.125-sigma resolution in stage 2;
@@ -103,10 +103,13 @@ class Trader:
         },
         "window": {
             "type": "int",
-            # 20, 50, 100, 200 -> 4 values.  Short windows catch tight
-            # mean-reverters (RAINFOREST_RESIN), longer for drift-heavy
-            # products.  Values >= max_ticks are auto-clamped.
-            "grid": [20, 50, 100, 200],
+            # 20, 50, 100, 200, 300 -> 5 values.  Short windows catch
+            # tight mean-reverters (RAINFOREST_RESIN), longer ones give
+            # more stable z-score for drift-heavy products.  Extended to
+            # 300 after the Round-3 sensitivity plot showed mean-sharpe
+            # still monotonically rising at window=200 -- the optimum was
+            # outside the old grid.  Values >= max_ticks are auto-clamped.
+            "grid": [20, 50, 100, 200, 300],
         },
     }
 

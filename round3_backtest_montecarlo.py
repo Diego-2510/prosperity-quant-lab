@@ -1088,9 +1088,19 @@ def plot_ou_calibration(
       2. overlay of ``n_overlay`` simulated paths on the same axes
       3. histogram of simulated terminal levels vs. historical mean/std
     Skips silently on error.
+
+    Only products that actually got OU-simulated (mc_paths entry present AND
+    theta > 1e-6) are plotted -- products on the bootstrap path are filtered
+    out, so the figure does not ship 13 empty panels per run.
     """
-    products = list(ou_params.keys())
+    # Only plot products that actually got OU-simulated -- mc_paths is
+    # already filtered by the caller to OU products only, so we key off
+    # its presence (not ou_params, which keeps all products for diagnostics).
+    products = [p for p in ou_params.keys()
+                if p in mc_paths and mc_paths[p] is not None
+                and mc_paths[p].size]
     if not products:
+        print("[INFO] plot_ou_calibration: no OU-simulated products -- skipping")
         return
     rows = len(products)
     fig, axes = plt.subplots(rows, 3, figsize=(15, 3.2 * rows), squeeze=False)
@@ -1691,12 +1701,24 @@ def run_backtest_on_series(
                     position_limits, nm, t * TICK_STEP, "APPROX",
                 )
                 for f in fills:
+                    # BUGFIX: _apply_fill reads position[f.product] to detect
+                    # opening vs closing (for round-trip PnL tracking). The
+                    # vectorised loop only mutates pos_arr, so without this
+                    # sync the position dict stayed 0 forever and every fill
+                    # looked like an "opening" -- which made hit_rate_active
+                    # and mean_round_trips_per_path collapse to 0 across the
+                    # entire grid. We sync BEFORE (so _apply_fill sees the
+                    # correct old_pos) and AFTER (so subsequent fills in the
+                    # same tick see the updated state).
+                    pi = prod_idx.get(f.product)
+                    if pi is not None:
+                        position[f.product] = int(pos_arr[pi])
                     _apply_fill(f.product, f.quantity, f.price)
                     cash -= f.price * f.quantity
                     turnover += abs(f.price * f.quantity)
-                    pi = prod_idx.get(f.product)
                     if pi is not None:
                         pos_arr[pi] += f.quantity
+                        position[f.product] = int(pos_arr[pi])
                     else:
                         position[f.product] = position.get(f.product, 0) + f.quantity
                 n_fills += len(fills)

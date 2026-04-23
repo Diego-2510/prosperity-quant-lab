@@ -348,6 +348,34 @@ Sections in the script (numbered comments at the top of each):
   MC budget, without blowing up the combination count.
 - The historical EXACT pass is expensive. It is skipped inside the
   grid search by default; pass `--grid-with-hist` to re-enable it.
+- **Three opt-in speed knobs** for smoke tests: `--skip-stability`
+  (skips the top-K box-plot leg, ~100 extra backtests), `--skip-extra-plots`
+  (skips sensitivity / hit-map / heatmap, keeps equity curve + fan chart +
+  Pareto + top-ranking + OU calibration + final-PnL distribution),
+  and `--lean-metrics` (skips per-path drawdown / hit-rate / turnover /
+  inventory-std — keeps only `final_pnl` and `n_trades` for ranking).
+
+### Sizing the CTF grid — avoid multi-hour Stage-2 runs
+
+The fine stage grid size grows **geometrically** with `--ctf-n-interp`
+across the number of numeric parameters.  For a 4-parameter PARAM_SPEC
+(typical `mean_reversion.py`: `entry_sigma, sigma_gap, max_hold_ticks,
+window`), empirical Stage-2 sizes on a top-40 coarse selection
+(`--ctf-top-frac 0.15` of a 400-combo coarse grid) are:
+
+| `--ctf-n-interp` | Stage-2 combos | Ballpark wall time (16 cores, `n-eval=15`) |
+|:---:|---:|---:|
+| 0 | ~40    | ~15 s |
+| 1 | ~1 400 | ~10 min |
+| 2 | ~7 000 | ~50 min |
+| 3 | ~25 000 | ~3 h 30 min |
+| 4 | ~65 000 | ~8 h |
+
+Rule of thumb: **start with `--ctf-n-interp 1`** for daily iteration,
+bump to `2` only when a parameter is clearly under-resolved, and reserve
+`3` for the very last submission-candidate sweep. A full Round-3 baseline
+with 400 coarse × 1 400 fine combos, 10 products simulated, `n-eval=15`,
+and `--n-workers -1` finishes under 15 minutes on a 16-core laptop.
 
 ## Known limitations
 
