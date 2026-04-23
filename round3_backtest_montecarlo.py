@@ -2473,6 +2473,7 @@ def run_pipeline(
     skip_stability: bool = False,
     skip_extra_plots: bool = False,
     lean_metrics: bool = False,
+    skip_final_reval: bool = False,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -2769,33 +2770,129 @@ def run_pipeline(
     print(f"[INFO] grid results (active): {len(full_results)} rows "
           f"(of {len(full_results_full)} total)")
 
+    # ---------------------------------------------------------------
+    # Stage-bias mitigation: coarse-stage combos were evaluated with
+    # far fewer MC paths than fine-stage combos, so their sharpe
+    # estimates have much higher variance. Ranking them side by side
+    # with fine-stage combos lets a lucky coarse winner beat a truly
+    # robust fine winner. When a two-stage CTF was run AND we have at
+    # least some fine-stage rows, restrict the ranking pool to fine.
+    #
+    # Additionally, re-evaluate the top-K fine candidates with the
+    # richer eval_paths_final budget before picking the winner. This
+    # neutralises the extreme-value bias baked into nlargest().
+    # Controlled by --skip-final-reval (on by default for robustness).
+    # ---------------------------------------------------------------
+    if ctf_enabled and "stage" in full_results.columns:
+        fine_only = full_results[full_results["stage"] == "fine"].copy()
+        n_coarse_in_top = 0
+        if not fine_only.empty and rank_metric in fine_only.columns:
+            # How many of the current Top-10 are from the coarse leg?
+            cur_top10 = full_results.nlargest(10, rank_metric)
+            n_coarse_in_top = int((cur_top10.get("stage", pd.Series()) == "coarse").sum())
+            if n_coarse_in_top > 0:
+                print(f"[RANK] stage-bias guard: removing {n_coarse_in_top} "
+                      f"coarse-stage row(s) from Top-10 ranking pool "
+                      f"(coarse was evaluated with n_eval={ctf_eval_coarse}, "
+                      f"fine with n_eval={ctf_eval_fine} -- coarse stats are noisier)."
+                      )
+            ranking_pool = fine_only.reset_index(drop=True)
+        else:
+            ranking_pool = full_results
+    else:
+        ranking_pool = full_results
+
+    # Final Top-K re-evaluation with the richer eval_paths_final budget.
+    # Re-evaluates only the current Top-K candidates (default 10) so it
+    # stays cheap -- K * eval_paths_final additional MC backtests.
+    n_reval_eff = max(1, min(n_paths, eval_paths_final))
+    reval_k = 10
+    _median_n_eval = (
+        float(ranking_pool["n_eval_paths"].median())
+        if ("n_eval_paths" in ranking_pool.columns and not ranking_pool.empty)
+        else 0.0
+    )
+    if np.isnan(_median_n_eval):
+        _median_n_eval = 0.0
+    if (not skip_final_reval
+            and not ranking_pool.empty
+            and rank_metric in ranking_pool.columns
+            and n_reval_eff > int(_median_n_eval)):
+        reval_cands = ranking_pool.nlargest(reval_k, rank_metric).reset_index(drop=True)
+        reval_param_rows = [
+            {k: r[k] for k in spec.keys() if k in r}
+            for _, r in reval_cands.iterrows()
+        ]
+        print(f"[RANK] final re-evaluation: {len(reval_param_rows)} top candidates "
+              f"x {n_reval_eff} MC paths each "
+              f"(replaces noisy grid-stage sharpe with robust estimates)")
+        reval_rows: List[Dict[str, Any]] = []
+        reval_jobs = [(p, n_reval_eff) for p in reval_param_rows]
+        reval_raw = _parallel_map(
+            reval_jobs,
+            _eval_combo_worker_shared,
+            n_workers=n_workers, desc="final re-eval",
+            initializer=_worker_init, initargs=worker_init_args,
+        )
+        for p, r in zip(reval_param_rows, reval_raw):
+            if r is None:
+                continue
+            row = dict(p)
+            row.update(r)
+            row["stage"] = "reval"
+            reval_rows.append(row)
+        if reval_rows:
+            reval_df = pd.DataFrame(reval_rows)
+            # Merge reval rows back into ranking_pool. Drop the old grid
+            # rows for the same param combos (identified by all spec keys)
+            # so they don't double-count in downstream ranking.
+            key_cols = list(spec.keys())
+            rp = ranking_pool.copy()
+            # Build composite key for matching
+            rp["_reval_key"] = rp[key_cols].astype(str).agg("|".join, axis=1)
+            reval_df["_reval_key"] = reval_df[key_cols].astype(str).agg("|".join, axis=1)
+            rp = rp[~rp["_reval_key"].isin(reval_df["_reval_key"])]
+            ranking_pool = pd.concat(
+                [rp, reval_df], axis=0, ignore_index=True, sort=False
+            ).drop(columns=["_reval_key"], errors="ignore").reset_index(drop=True)
+            # Persist a dedicated CSV so the user can inspect re-eval deltas.
+            reval_df.drop(columns=["_reval_key"], errors="ignore").to_csv(
+                out_dir / "final_reval.csv", index=False,
+            )
+            print(f"[RANK] re-eval finished; merged {len(reval_df)} refined rows "
+                  f"back into ranking pool. See final_reval.csv.")
+
     # -- Pareto + robust Top-2.
     pareto = pareto_frontier(full_results.dropna(subset=["variance", "mean_profit"]),
                              x_col="variance", y_col="mean_profit", maximize_y=True)
     pareto.to_csv(out_dir / "pareto_front.csv", index=False)
 
     # --- New artifact: Top-10 by Sharpe (submission-ready candidates).
-    if "sharpe" in full_results.columns and not full_results.empty:
-        top10_by_sharpe = full_results.nlargest(10, "sharpe").reset_index(drop=True)
+    # Sourced from the (stage-filtered + re-eval'd) ranking_pool, not from
+    # the raw full_results frame, to avoid stage-bias contamination.
+    if "sharpe" in ranking_pool.columns and not ranking_pool.empty:
+        top10_by_sharpe = ranking_pool.nlargest(10, "sharpe").reset_index(drop=True)
         top10_by_sharpe.to_csv(out_dir / "top10_by_sharpe.csv", index=False)
         print("[INFO] Top-10 by Sharpe (submission candidates):")
         show_cols = [c for c in [*spec.keys(), "mean_profit", "median_profit",
                                  "sharpe", "profit_per_trade", "mean_trades_per_path",
-                                 "VaR_5", "CVaR_5"] if c in top10_by_sharpe.columns]
+                                 "VaR_5", "CVaR_5", "n_eval_paths", "stage"]
+                     if c in top10_by_sharpe.columns]
         print(top10_by_sharpe[show_cols].to_string(index=False))
 
-    top2 = pick_top2_robust(full_results, metric=rank_metric)
+    top2 = pick_top2_robust(ranking_pool, metric=rank_metric)
     top2.to_csv(out_dir / "top_parameter_pairs.csv", index=False)
     print(f"[INFO] Robust Top-2 parameter sets (ranked by '{rank_metric}'):")
     print(top2.to_string(index=False))
 
     # -- Visualization.
     # Historical equity for best params (one EXACT run, no grid overhead).
-    # 'Best' is picked using the ranking metric from the active pool, so the
-    # fan chart and equity curve reflect a strategy that actually trades.
+    # 'Best' is picked using the ranking metric from the ranking_pool
+    # (stage-filtered + re-eval'd), so the fan chart and equity curve
+    # reflect the robust winner rather than a coarse-stage lucky outlier.
     best_row = None
-    if not full_results.empty and rank_metric in full_results.columns:
-        best_row = full_results.nlargest(1, rank_metric).iloc[0].to_dict()
+    if not ranking_pool.empty and rank_metric in ranking_pool.columns:
+        best_row = ranking_pool.nlargest(1, rank_metric).iloc[0].to_dict()
         best_params = {k: best_row[k] for k in spec.keys() if k in best_row}
         print(f"[INFO] Best params by '{rank_metric}': {best_params} "
               f"(mean_profit={best_row.get('mean_profit', float('nan')):.1f}, "
@@ -2986,6 +3083,12 @@ def parse_args() -> argparse.Namespace:
                     help="Skip per-path risk metrics (drawdown, hit-rate, turnover, "
                          "inventory-std, round-trips) during grid evaluation. "
                          "Keeps only final_pnl + n_trades -- faster per-combo loop.")
+    ap.add_argument("--skip-final-reval", action="store_true",
+                    help="Skip the final Top-K re-evaluation with eval_paths_final. "
+                         "Default behaviour re-evaluates the Top-10 fine candidates "
+                         "with the richer MC budget before picking the winner, which "
+                         "removes the extreme-value bias from nlargest(). Disable only "
+                         "for smoke tests -- it costs K * eval_paths_final extra runs.")
     return ap.parse_args()
 
 
@@ -3114,6 +3217,7 @@ if __name__ == "__main__":
             skip_stability=args.skip_stability,
             skip_extra_plots=args.skip_extra_plots,
             lean_metrics=args.lean_metrics,
+            skip_final_reval=args.skip_final_reval,
         )
     except Exception as e:
         traceback.print_exc()
