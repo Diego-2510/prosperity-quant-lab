@@ -67,6 +67,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 import pandas as pd
 
+try:
+    from scipy.stats import norm as _scipy_norm  # type: ignore
+    _HAS_SCIPY = True
+except ImportError:  # pragma: no cover -- scipy is a runtime dep of pandas/sklearn
+    _HAS_SCIPY = False
+    _scipy_norm = None  # type: ignore
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -2428,6 +2435,447 @@ def plot_stability(top_k_path_profits: List[np.ndarray], labels: List[str], out:
 # =============================================================================
 
 
+# =============================================================================
+#  BLACK-SCHOLES + VOLATILITY SMILE (Prosperity-4 Round 3 -- VEV options)
+# =============================================================================
+#
+#  Two distinct concepts that MUST NOT be mixed:
+#    * TTE_days        -- integer Solvenarian days until expiry (8, 7, 6, 5...).
+#                         This is *time of expiration* -- a calendar countdown.
+#    * T (T_years)     -- time to MATURITY, in years, the BS formula's input.
+#                         T_years = TTE_days_remaining / DAYS_PER_YEAR.
+#
+#  For our P4-R3 dataset (see problem statement):
+#    historical day 0 (tutorial round)  -> TTE_days starts at 8
+#    historical day 1 (Round 1)         -> TTE_days starts at 7
+#    historical day 2 (Round 2)         -> TTE_days starts at 6
+#    live  Round 3 submission           -> TTE_days starts at 5
+#
+#  So the per-tick remaining TTE in Solvenarian days is
+#      tte_days_remaining(day, timestamp) = TTE_BASE_DAYS - day
+#                                           - timestamp / TICKS_PER_DAY
+#  where TICKS_PER_DAY = 1_000_000 (Prosperity timestamps step by 100 up to
+#  999_900 per day). We divide by DAYS_PER_YEAR=365 to get T_years for BS.
+#
+#  Black-Scholes assumptions for this competition (user-confirmed):
+#    r (risk-free rate)    = 0.0  (annualised, continuously compounded)
+#    q (dividend yield)    = 0.0
+#    option style          = European call
+#    no early exercise
+# =============================================================================
+
+DAYS_PER_YEAR: int = 365               # annualisation factor for BS T_years
+TICKS_PER_DAY: int = 1_000_000         # max Prosperity timestamp per day + 100
+# Default TTE at the start of historical day 0 for the Round 3 dataset. The
+# user can override this via --tte-base-days when the dataset corresponds to a
+# different round (e.g. for a Round 4 dataset where historical day 0 starts at
+# TTE=6 because two live rounds have already been consumed).
+DEFAULT_TTE_BASE_DAYS: int = 8
+
+
+def _std_norm_cdf(x: float) -> float:
+    if _HAS_SCIPY:
+        return float(_scipy_norm.cdf(x))
+    # Abramowitz-Stegun 7.1.26 approximation; max error ~1.5e-7. Sufficient
+    # for IV solving, though scipy is preferred when available.
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _std_norm_pdf(x: float) -> float:
+    if _HAS_SCIPY:
+        return float(_scipy_norm.pdf(x))
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def bs_call_price(S: float, K: float, T: float, sigma: float, r: float = 0.0) -> float:
+    """Black-Scholes European call price. r=0, no dividends.
+
+    Parameters
+    ----------
+    S : underlying spot price
+    K : strike price
+    T : time to MATURITY in years (NOT TTE in Solvenarian days)
+    sigma : annualised implied volatility (same time unit as T)
+    r : risk-free rate, continuously compounded (always 0 here)
+    """
+    if T <= 0.0 or sigma <= 0.0 or S <= 0.0 or K <= 0.0:
+        return max(0.0, S - K * math.exp(-r * max(T, 0.0)))
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
+    return S * _std_norm_cdf(d1) - K * math.exp(-r * T) * _std_norm_cdf(d2)
+
+
+def bs_vega(S: float, K: float, T: float, sigma: float, r: float = 0.0) -> float:
+    """Black-Scholes vega dC/dsigma. Used by Newton's method for IV."""
+    if T <= 0.0 or sigma <= 0.0 or S <= 0.0 or K <= 0.0:
+        return 0.0
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt_T)
+    return S * _std_norm_pdf(d1) * sqrt_T
+
+
+def bs_delta(S: float, K: float, T: float, sigma: float, r: float = 0.0) -> float:
+    """Delta of a European call (N(d1))."""
+    if T <= 0.0 or sigma <= 0.0 or S <= 0.0 or K <= 0.0:
+        return 1.0 if S > K else 0.0
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt_T)
+    return _std_norm_cdf(d1)
+
+
+def bs_implied_vol(
+    market_price: float,
+    S: float,
+    K: float,
+    T: float,
+    r: float = 0.0,
+    tol: float = 1e-6,
+    max_iter: int = 100,
+    sigma_lo: float = 1e-4,
+    sigma_hi: float = 5.0,
+) -> Optional[float]:
+    """Invert BS for sigma: Newton-Raphson with bisection fallback.
+
+    Returns None when:
+      * market price is below intrinsic value (no real IV),
+      * T <= 0 (option already expired),
+      * the solver does not converge inside [sigma_lo, sigma_hi].
+
+    r=0, no dividends.
+    """
+    if T <= 0.0 or S <= 0.0 or K <= 0.0 or market_price <= 0.0:
+        return None
+    intrinsic = max(0.0, S - K * math.exp(-r * T))
+    # Require *strictly positive* extrinsic so vega is meaningful.
+    if market_price <= intrinsic + 1e-10:
+        return None
+    # Brenner-Subrahmanyam seed (close-to-ATM) gives a robust starting point.
+    sigma = max(sigma_lo, min(sigma_hi,
+                              math.sqrt(2.0 * math.pi / T) * market_price / S))
+    for _ in range(max_iter):
+        price = bs_call_price(S, K, T, sigma, r)
+        diff = price - market_price
+        if abs(diff) < tol:
+            return sigma
+        vega = bs_vega(S, K, T, sigma, r)
+        if vega < 1e-10:
+            break  # fall through to bisection
+        sigma_next = sigma - diff / vega
+        if not math.isfinite(sigma_next):
+            break
+        sigma = max(sigma_lo, min(sigma_hi, sigma_next))
+    # Bisection fallback on [sigma_lo, sigma_hi].
+    lo, hi = sigma_lo, sigma_hi
+    f_lo = bs_call_price(S, K, T, lo, r) - market_price
+    f_hi = bs_call_price(S, K, T, hi, r) - market_price
+    if f_lo * f_hi > 0:
+        return None  # no root in the interval
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        f_mid = bs_call_price(S, K, T, mid, r) - market_price
+        if abs(f_mid) < tol or (hi - lo) < tol:
+            return mid
+        if f_lo * f_mid <= 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return 0.5 * (lo + hi)
+
+
+def tte_days_remaining(
+    day: int, timestamp: int, tte_base_days: int = DEFAULT_TTE_BASE_DAYS
+) -> float:
+    """Time TO EXPIRATION in *Solvenarian days* (not years).
+
+    NOT a valid BS input on its own -- convert to years via
+    :func:`tte_to_maturity_years`.
+    """
+    return max(0.0, tte_base_days - day - timestamp / TICKS_PER_DAY)
+
+
+def tte_to_maturity_years(
+    day: int,
+    timestamp: int,
+    tte_base_days: int = DEFAULT_TTE_BASE_DAYS,
+    days_per_year: int = DAYS_PER_YEAR,
+) -> float:
+    """Time to MATURITY in years (valid BS input)."""
+    return tte_days_remaining(day, timestamp, tte_base_days) / days_per_year
+
+
+_VEV_STRIKE_RE = re.compile(r"^(?:VEV|VELVETFRUIT_EXTRACT_VOUCHER)_(\d+)$")
+
+
+def extract_voucher_strike(product: str) -> Optional[float]:
+    """Return the integer strike embedded in a VEV / full voucher product name.
+
+    Handles both the short alias ``VEV_5000`` and the official full name
+    ``VELVETFRUIT_EXTRACT_VOUCHER_5000``. Returns None for non-option products.
+    """
+    m = _VEV_STRIKE_RE.match(product)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _resolve_underlying_column(products: Iterable[str]) -> Optional[str]:
+    """Return the underlying product name if present in the dataset."""
+    candidates = ("VELVETFRUIT_EXTRACT", "VOLCANIC_ROCK")  # P4-R3 / P3-R4 fallback
+    prods = set(products)
+    for c in candidates:
+        if c in prods:
+            return c
+    return None
+
+
+def build_vol_smile_table(
+    prices_df: pd.DataFrame,
+    tte_base_days: int = DEFAULT_TTE_BASE_DAYS,
+    days_per_year: int = DAYS_PER_YEAR,
+    min_extrinsic: float = 0.5,
+    min_T: float = 1e-6,
+) -> pd.DataFrame:
+    """Per-tick IV + moneyness table for every voucher in prices_df.
+
+    Vectorised end-to-end (no per-row Python loop over the joined frame).
+    Drops ticks with non-positive extrinsic value -- those are the
+    bottom-left outliers from figure 6a. Columns of the returned frame:
+        day, timestamp, product, K, S, market_price,
+        TTE_days, T_years, m_t, IV
+    """
+    products = list(prices_df["product"].unique())
+    underlying = _resolve_underlying_column(products)
+    if underlying is None:
+        print("[VOL-SMILE] No recognisable underlying found (expected "
+              "VELVETFRUIT_EXTRACT); skipping.")
+        return pd.DataFrame()
+    vouchers = [(p, extract_voucher_strike(p)) for p in products]
+    vouchers = [(p, k) for p, k in vouchers if k is not None]
+    if not vouchers:
+        print("[VOL-SMILE] No voucher products (VEV_*) found; skipping.")
+        return pd.DataFrame()
+
+    und = (prices_df[prices_df["product"] == underlying]
+           [["day", "timestamp", "mid_price"]]
+           .rename(columns={"mid_price": "S"}))
+    rows: List[pd.DataFrame] = []
+    for prod, strike in vouchers:
+        sub = prices_df[prices_df["product"] == prod][[
+            "day", "timestamp", "mid_price"]].rename(columns={"mid_price": "market_price"})
+        if sub.empty:
+            continue
+        merged = sub.merge(und, on=["day", "timestamp"], how="inner")
+        merged = merged.dropna(subset=["S", "market_price"])
+        merged = merged[(merged["S"] > 0) & (merged["market_price"] > 0)]
+        if merged.empty:
+            continue
+        merged["product"] = prod
+        merged["K"] = float(strike)
+        # TTE vectorised.
+        tte_days = (tte_base_days
+                    - merged["day"].to_numpy()
+                    - merged["timestamp"].to_numpy() / TICKS_PER_DAY)
+        T_years = np.maximum(tte_days, 0.0) / days_per_year
+        merged["TTE_days"] = tte_days
+        merged["T_years"] = T_years
+        # Keep only ticks with meaningful extrinsic value AND T > 0.
+        intrinsic = np.maximum(merged["S"].to_numpy() - merged["K"].to_numpy(), 0.0)
+        extrinsic = merged["market_price"].to_numpy() - intrinsic
+        mask = (T_years > min_T) & (extrinsic > min_extrinsic)
+        merged = merged.loc[mask].reset_index(drop=True)
+        if merged.empty:
+            continue
+        # Moneyness m_t = log(K / S) / sqrt(T_years). Uses T (years), NOT TTE_days.
+        merged["m_t"] = (np.log(merged["K"].to_numpy() / merged["S"].to_numpy())
+                         / np.sqrt(merged["T_years"].to_numpy()))
+        # IV solved per row (no vector BS inverse; fast enough for ~60k rows).
+        ivs = np.empty(len(merged), dtype=float)
+        S_arr = merged["S"].to_numpy()
+        K_arr = merged["K"].to_numpy()
+        P_arr = merged["market_price"].to_numpy()
+        T_arr = merged["T_years"].to_numpy()
+        for i in range(len(merged)):
+            iv = bs_implied_vol(P_arr[i], S_arr[i], K_arr[i], T_arr[i], r=0.0)
+            ivs[i] = iv if (iv is not None and iv > 0) else np.nan
+        merged["IV"] = ivs
+        merged = merged.dropna(subset=["IV"])
+        if not merged.empty:
+            rows.append(merged)
+
+    if not rows:
+        print("[VOL-SMILE] IV extraction produced no valid rows; skipping.")
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True)
+    out = out[["day", "timestamp", "product", "K", "S",
+               "market_price", "TTE_days", "T_years", "m_t", "IV"]]
+    return out
+
+
+def fit_vol_smile_parabola(
+    smile_table: pd.DataFrame,
+) -> Tuple[Optional[np.ndarray], pd.DataFrame]:
+    """Fit IV ~ a*m^2 + b*m + c on the IV/moneyness table.
+
+    Augments ``smile_table`` with:
+        smile_IV          : fitted v_hat at each tick's m_t
+        iv_deviation      : IV - smile_IV      (figure 6b signal)
+        bs_theo_price     : BS(S, K, T, smile_IV, r=0)
+        price_deviation   : market_price - bs_theo_price   (figure 6c signal)
+    Returns (coeffs, augmented_table). coeffs=None if fit failed.
+    """
+    if smile_table.empty:
+        return None, smile_table
+    m = smile_table["m_t"].to_numpy()
+    iv = smile_table["IV"].to_numpy()
+    finite = np.isfinite(m) & np.isfinite(iv)
+    if finite.sum() < 10:
+        print("[VOL-SMILE] Too few valid IV points for a degree-2 fit.")
+        return None, smile_table
+    try:
+        coeffs = np.polyfit(m[finite], iv[finite], deg=2)
+    except Exception as exc:
+        print(f"[VOL-SMILE] polyfit failed: {exc}")
+        return None, smile_table
+    poly = np.poly1d(coeffs)
+    smile_table = smile_table.copy()
+    smile_table["smile_IV"] = poly(smile_table["m_t"].to_numpy())
+    smile_table["iv_deviation"] = smile_table["IV"] - smile_table["smile_IV"]
+    theo = np.empty(len(smile_table), dtype=float)
+    S_arr = smile_table["S"].to_numpy()
+    K_arr = smile_table["K"].to_numpy()
+    T_arr = smile_table["T_years"].to_numpy()
+    IV_arr = smile_table["smile_IV"].to_numpy()
+    for i in range(len(smile_table)):
+        s = IV_arr[i] if (np.isfinite(IV_arr[i]) and IV_arr[i] > 0) else 1e-4
+        theo[i] = bs_call_price(S_arr[i], K_arr[i], T_arr[i], s, r=0.0)
+    smile_table["bs_theo_price"] = theo
+    smile_table["price_deviation"] = smile_table["market_price"] - smile_table["bs_theo_price"]
+    return coeffs, smile_table
+
+
+def plot_vol_smile_scatter(
+    table: pd.DataFrame, coeffs: np.ndarray, out: Path
+) -> None:
+    """Figure 6a: IV vs moneyness scatter, colored by strike, fitted parabola."""
+    if table.empty or coeffs is None:
+        return
+    fig, ax = plt.subplots(figsize=(11, 5))
+    strikes = sorted(table["K"].unique())
+    cmap = plt.get_cmap("tab10")
+    for i, k in enumerate(strikes):
+        sub = table[table["K"] == k]
+        ax.scatter(sub["m_t"], sub["IV"], s=3, alpha=0.5,
+                   color=cmap(i % 10), label=f"strike={int(k)}")
+    # Parabola overlay on the observed moneyness range.
+    m_min, m_max = table["m_t"].min(), table["m_t"].max()
+    m_line = np.linspace(m_min, m_max, 400)
+    ax.plot(m_line, np.poly1d(coeffs)(m_line),
+            color="black", lw=2.5, label="fitted parabola")
+    ax.set_xlabel("m_t = log(K/S) / sqrt(T_years)")
+    ax.set_ylabel("v_t (implied vol, annualized)")
+    ax.set_title(f"VEV volatility smile  "
+                 f"(fit: {coeffs[0]:.4f} m^2 + {coeffs[1]:+.4f} m + {coeffs[2]:+.4f})")
+    ax.grid(True, alpha=0.3)
+    ax.legend(markerscale=3, loc="best", fontsize=8)
+    save_plot(fig, out)
+
+
+def plot_iv_deviation_ts(table: pd.DataFrame, out: Path) -> None:
+    """Figure 6b: time series of IV - smile_IV, one line per strike."""
+    if table.empty or "iv_deviation" not in table.columns:
+        return
+    fig, ax = plt.subplots(figsize=(12, 4))
+    # Build a continuous timestamp that spans all days for readability.
+    t_cont = table["day"].to_numpy() * TICKS_PER_DAY + table["timestamp"].to_numpy()
+    tmp = table.copy()
+    tmp["t_cont"] = t_cont
+    cmap = plt.get_cmap("tab10")
+    for i, k in enumerate(sorted(tmp["K"].unique())):
+        sub = tmp[tmp["K"] == k].sort_values("t_cont")
+        ax.plot(sub["t_cont"], sub["iv_deviation"], lw=0.6, alpha=0.8,
+                color=cmap(i % 10), label=f"strike={int(k)}")
+    ax.axhline(0, color="black", lw=0.6)
+    ax.set_xlabel("timestamp (day-continuous)")
+    ax.set_ylabel("Option_IV - VolSmile_IV")
+    ax.set_title("IV deviation vs fitted smile (figure 6b)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=8)
+    save_plot(fig, out)
+
+
+def plot_price_deviation_ts(table: pd.DataFrame, out: Path) -> None:
+    """Figure 6c: time series of market_price - bs_theo_price, per strike."""
+    if table.empty or "price_deviation" not in table.columns:
+        return
+    fig, ax = plt.subplots(figsize=(12, 4))
+    t_cont = table["day"].to_numpy() * TICKS_PER_DAY + table["timestamp"].to_numpy()
+    tmp = table.copy()
+    tmp["t_cont"] = t_cont
+    cmap = plt.get_cmap("tab10")
+    for i, k in enumerate(sorted(tmp["K"].unique())):
+        sub = tmp[tmp["K"] == k].sort_values("t_cont")
+        ax.plot(sub["t_cont"], sub["price_deviation"], lw=0.6, alpha=0.8,
+                color=cmap(i % 10), label=f"strike={int(k)}")
+    ax.axhline(0, color="black", lw=0.6)
+    ax.set_xlabel("timestamp (day-continuous)")
+    ax.set_ylabel("Option_Price - BS_theo(VolSmile_IV)")
+    ax.set_title("Voucher price deviation vs BS theoretical (figure 6c)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=8)
+    save_plot(fig, out)
+
+
+def run_vol_smile_analysis(
+    prices_df: pd.DataFrame,
+    out_dir: Path,
+    tte_base_days: int = DEFAULT_TTE_BASE_DAYS,
+    days_per_year: int = DAYS_PER_YEAR,
+    min_extrinsic: float = 0.5,
+) -> Optional[np.ndarray]:
+    """End-to-end: IV table -> parabola fit -> CSV + 3 plots.
+
+    Returns the parabola coefficients [a, b, c] for downstream traders, or
+    None if there is not enough data to fit (e.g. no VEV products present).
+    """
+    print(f"[VOL-SMILE] computing IV + moneyness table "
+          f"(tte_base_days={tte_base_days}, days_per_year={days_per_year}, "
+          f"min_extrinsic={min_extrinsic})")
+    table = build_vol_smile_table(
+        prices_df, tte_base_days=tte_base_days,
+        days_per_year=days_per_year, min_extrinsic=min_extrinsic,
+    )
+    if table.empty:
+        return None
+    coeffs, table = fit_vol_smile_parabola(table)
+    if coeffs is None:
+        return None
+    print(f"[VOL-SMILE] parabola coeffs (a, b, c) = "
+          f"[{coeffs[0]:.6f}, {coeffs[1]:.6f}, {coeffs[2]:.6f}]  "
+          f"(fit on {len(table)} ticks)")
+    # Artefacts.
+    table.to_csv(out_dir / "vol_smile_per_tick.csv", index=False)
+    with open(out_dir / "vol_smile_fit.json", "w") as f:
+        json.dump({
+            "tte_base_days": tte_base_days,
+            "days_per_year": days_per_year,
+            "min_extrinsic": min_extrinsic,
+            "r": 0.0,
+            "dividend_yield": 0.0,
+            "parabola_coeffs_highest_first": [float(x) for x in coeffs],
+            "n_ticks": int(len(table)),
+            "m_t_range": [float(table["m_t"].min()), float(table["m_t"].max())],
+            "IV_range": [float(table["IV"].min()), float(table["IV"].max())],
+        }, f, indent=2)
+    plot_vol_smile_scatter(table, coeffs, out_dir / "plot_vol_smile_scatter.png")
+    plot_iv_deviation_ts(table, out_dir / "plot_iv_deviation_ts.png")
+    plot_price_deviation_ts(table, out_dir / "plot_price_deviation_ts.png")
+    return coeffs
+
+
 def _single_day_keys(
     ordered_keys: List[Tuple[int, int]], exact_days: int
 ) -> List[Tuple[int, int]]:
@@ -2475,6 +2923,8 @@ def run_pipeline(
     lean_metrics: bool = False,
     skip_final_reval: bool = False,
     param_grid_overrides: Optional[Dict[str, List[Any]]] = None,
+    tte_base_days: int = DEFAULT_TTE_BASE_DAYS,
+    skip_vol_smile: bool = False,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -2532,6 +2982,27 @@ def run_pipeline(
                 "ask_volume_1": 30,
             }))
         prices_df = pd.concat(days, ignore_index=True)
+
+    # -- Volatility-smile analysis (VEV vouchers, Black-Scholes with r=0,
+    # no dividends). Auto-skipped when no VEV products are in the dataset.
+    if not skip_vol_smile:
+        try:
+            vev_mask = prices_df["product"].astype(str).str.match(
+                r"^(?:VEV|VELVETFRUIT_EXTRACT_VOUCHER)_\d+$"
+            )
+            if vev_mask.any():
+                print(f"[VOL-SMILE] detected {int(vev_mask.sum())} voucher rows -- running analysis")
+                run_vol_smile_analysis(
+                    prices_df, out_dir=out_dir, tte_base_days=tte_base_days,
+                )
+            else:
+                print("[VOL-SMILE] no VEV_* / VELVETFRUIT_EXTRACT_VOUCHER_* products -- skipping")
+        except Exception as exc:  # pragma: no cover
+            # Diagnostic only -- must never crash the main pipeline.
+            print(f"[VOL-SMILE] analysis failed: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+    else:
+        print("[VOL-SMILE] analysis skipped (--skip-vol-smile)")
 
     # -- Features.
     features = build_feature_frame(prices_df)
@@ -3103,6 +3574,17 @@ def parse_args() -> argparse.Namespace:
                          "thresholds without editing the trader file, e.g. "
                          "--param-grid 'entry_sigma=0.75,1.0,1.25,1.5,1.75,2.0,2.5,3.0' "
                          "--param-grid 'window=20,40,60,80,100,150,200,300'.")
+    # Volatility-smile analysis (VEV vouchers, Black-Scholes with r=0, q=0).
+    ap.add_argument("--tte-base-days", type=int, default=DEFAULT_TTE_BASE_DAYS,
+                    help="Calendar days until voucher expiry at day=0, timestamp=0 "
+                         "(Prosperity-4 Round 3 dataset: 8). TTE_days = "
+                         "tte_base_days - day - timestamp/1e6; T_years = "
+                         "TTE_days/365 is the Black-Scholes input.")
+    ap.add_argument("--skip-vol-smile", action="store_true",
+                    help="Skip the VEV voucher volatility-smile diagnostics "
+                         "(IV-vs-moneyness scatter, IV deviation TS, price "
+                         "deviation TS). Auto-skipped when no VEV_* products "
+                         "are in the dataset.")
     return ap.parse_args()
 
 
@@ -3359,6 +3841,8 @@ if __name__ == "__main__":
             lean_metrics=args.lean_metrics,
             skip_final_reval=args.skip_final_reval,
             param_grid_overrides=_parse_param_grid_overrides(args.param_grid),
+            tte_base_days=args.tte_base_days,
+            skip_vol_smile=args.skip_vol_smile,
         )
     except Exception as e:
         traceback.print_exc()
