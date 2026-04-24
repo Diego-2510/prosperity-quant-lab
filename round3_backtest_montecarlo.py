@@ -2474,6 +2474,7 @@ def run_pipeline(
     skip_extra_plots: bool = False,
     lean_metrics: bool = False,
     skip_final_reval: bool = False,
+    param_grid_overrides: Optional[Dict[str, List[Any]]] = None,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -2590,7 +2591,12 @@ def run_pipeline(
 
     # -- Parameter registry.
     spec = extract_param_spec(trader_cls)
+    if param_grid_overrides:
+        spec = _apply_param_grid_overrides(spec, param_grid_overrides)
     print(f"[INFO] Parameter registry keys: {list(spec.keys())}")
+    for _k, _v in spec.items():
+        _grid = _v.get("grid", []) if isinstance(_v, dict) else []
+        print(f"    {_k:<20s} type={_v.get('type','?'):<6s} n={len(_grid):<3d} grid={_grid}")
 
     # -- Monte-Carlo paths (truncated to max_ticks if set).
     # Per-product method resolution: base = global mc_method, overrides win.
@@ -3089,6 +3095,14 @@ def parse_args() -> argparse.Namespace:
                          "with the richer MC budget before picking the winner, which "
                          "removes the extreme-value bias from nlargest(). Disable only "
                          "for smoke tests -- it costs K * eval_paths_final extra runs.")
+    ap.add_argument("--param-grid", action="append", default=[],
+                    help="Override a trader parameter's grid with an arbitrary list "
+                         "of thresholds. Format: 'KEY=v1,v2,v3[,...]'. Repeatable -- "
+                         "supply once per parameter. Types are cast from the trader's "
+                         "PARAM_SPEC (int/float/bool). Use this to test many "
+                         "thresholds without editing the trader file, e.g. "
+                         "--param-grid 'entry_sigma=0.75,1.0,1.25,1.5,1.75,2.0,2.5,3.0' "
+                         "--param-grid 'window=20,40,60,80,100,150,200,300'.")
     return ap.parse_args()
 
 
@@ -3180,6 +3194,132 @@ def _parse_kv_str_overrides(
     return out
 
 
+def _cast_param_value(raw: str, declared_type: Optional[str]) -> Any:
+    """Cast a raw CLI token to the type declared in PARAM_SPEC.
+
+    declared_type is one of {'int', 'float', 'bool', None}. Unknown / missing
+    types fall back to best-effort (int -> float -> str). Bool accepts
+    true/false/1/0/yes/no, case-insensitive.
+    """
+    s = raw.strip()
+    t = (declared_type or "").lower()
+    if t == "bool":
+        low = s.lower()
+        if low in ("true", "1", "yes", "y", "on"):
+            return True
+        if low in ("false", "0", "no", "n", "off"):
+            return False
+        raise ValueError(f"cannot parse bool from '{raw}'")
+    if t == "int":
+        # Accept '2.0' as 2 only when it's exactly integral.
+        f = float(s)
+        if not f.is_integer():
+            raise ValueError(f"cannot cast non-integral '{raw}' to int")
+        return int(f)
+    if t == "float":
+        return float(s)
+    # Fallback: try int -> float -> str.
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s
+
+
+def _parse_param_grid_overrides(raw_list: List[str]) -> Dict[str, List[str]]:
+    """Parse a repeatable '--param-grid KEY=v1,v2,...' into {key: [raw_tokens]}.
+
+    Values are kept as raw strings here; actual type casting happens in
+    _apply_param_grid_overrides once the PARAM_SPEC type is known. Duplicate
+    keys overwrite earlier definitions (last-one-wins), with a warning.
+    """
+    out: Dict[str, List[str]] = {}
+    for raw in raw_list or []:
+        if "=" not in raw:
+            print(f"[WARN] Ignoring --param-grid '{raw}': missing '=' "
+                  f"(expected KEY=v1,v2,...)")
+            continue
+        key, vals = raw.split("=", 1)
+        key = key.strip()
+        if not key:
+            print(f"[WARN] Ignoring --param-grid '{raw}': empty key")
+            continue
+        tokens = [v.strip() for v in vals.split(",") if v.strip()]
+        if not tokens:
+            print(f"[WARN] Ignoring --param-grid '{raw}': no values after '='")
+            continue
+        if key in out:
+            print(f"[WARN] --param-grid '{key}' specified twice; keeping last")
+        out[key] = tokens
+    return out
+
+
+def _apply_param_grid_overrides(
+    spec: Dict[str, Any], overrides: Dict[str, List[str]]
+) -> Dict[str, Any]:
+    """Return a new PARAM_SPEC with overridden grids.
+
+    - Unknown keys (not in spec) emit a warning and are dropped. We refuse to
+      invent parameters, because the trader won't know about them.
+    - Tokens are cast to the declared PARAM_SPEC type (int/float/bool). Tokens
+      that fail to cast emit a warning and are skipped.
+    - Duplicate values within a single grid are de-duplicated, preserving input
+      order so users can control the coarse-to-fine scan direction.
+    - Empty resulting grids fall back to the original PARAM_SPEC grid.
+    """
+    if not overrides:
+        return spec
+    new_spec: Dict[str, Any] = {k: dict(v) if isinstance(v, dict) else v
+                                for k, v in spec.items()}
+    for key, raw_tokens in overrides.items():
+        if key not in new_spec:
+            print(f"[WARN] --param-grid '{key}' is not a known trader parameter "
+                  f"(PARAM_SPEC keys: {list(new_spec.keys())}); skipping.")
+            continue
+        entry = new_spec[key]
+        if not isinstance(entry, dict):
+            print(f"[WARN] PARAM_SPEC['{key}'] is not a dict; cannot override.")
+            continue
+        declared_type = entry.get("type")
+        cast_values: List[Any] = []
+        seen: set = set()
+        for tok in raw_tokens:
+            try:
+                val = _cast_param_value(tok, declared_type)
+            except Exception as exc:
+                print(f"[WARN] --param-grid '{key}': dropping '{tok}' ({exc})")
+                continue
+            # Use a hashable dedup key; for unhashable values (unlikely) fall
+            # back to string form.
+            try:
+                dedup_key = val
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+            except TypeError:
+                dedup_key = repr(val)
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+            cast_values.append(val)
+        if not cast_values:
+            print(f"[WARN] --param-grid '{key}' produced no valid values; "
+                  f"keeping PARAM_SPEC default {entry.get('grid')}")
+            continue
+        # Sort numeric grids so the coarse-to-fine interpolation logic works
+        # as expected (it inspects sorted numeric neighbours).
+        if declared_type in ("int", "float"):
+            cast_values = sorted(cast_values)
+        print(f"[PARAM-GRID] override '{key}': {cast_values} "
+              f"(n={len(cast_values)}, type={declared_type or 'auto'})")
+        entry["grid"] = cast_values
+    return new_spec
+
+
 if __name__ == "__main__":
     args = parse_args()
     try:
@@ -3218,6 +3358,7 @@ if __name__ == "__main__":
             skip_extra_plots=args.skip_extra_plots,
             lean_metrics=args.lean_metrics,
             skip_final_reval=args.skip_final_reval,
+            param_grid_overrides=_parse_param_grid_overrides(args.param_grid),
         )
     except Exception as e:
         traceback.print_exc()
