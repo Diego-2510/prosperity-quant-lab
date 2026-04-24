@@ -1,0 +1,13 @@
+{
+  "params": {
+    "entry_sigma": 1.0,
+    "sigma_gap": 1.5,
+    "max_hold_ticks": 500,
+    "window": 200
+  },
+  "rank_metric": "sharpe",
+  "mean_profit": 19321.33787055925,
+  "sharpe": 1.2069380291176182,
+  "profit_per_trade": 12.89521993585712,
+  "mean_trades_per_path": 1498.3333333333333
+}
