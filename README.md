@@ -48,15 +48,35 @@ a full set of artifacts (CSVs + plots) into an output directory.
   - Aggregated-side position-limit breach ⇒ *the entire side is
     dropped* for that product.
   - `traderData` is the only persistence between iterations.
-- **Monte-Carlo path generator** layering block bootstrap → residual
-  bootstrap → jump-aware perturbation.
+- **Monte-Carlo path generator** with two selectable methods:
+  - `bootstrap` (default): block bootstrap → residual bootstrap →
+    jump-aware perturbation.
+  - `ou`: Ornstein-Uhlenbeck mean-reverting parametric paths, with
+    auto-calibration of `(θ, μ, σ)` per product (optionally overridable
+    from the CLI).
+- **Per-product MC-method overrides**: e.g. OU for mean-reverting
+  underlyings, bootstrap for jumpy / trending products.
+- **Black-Scholes + volatility-smile diagnostics** (Round 3 vouchers):
+  automatic IV extraction (Newton-Raphson + bisection fallback),
+  quadratic smile fit in `m_t = log(K/S)/sqrt(T_years)` space, and the
+  three diagnostic plots used by the Frankfurt P3 top-2 README
+  (IV-vs-moneyness scatter, IV deviation TS, price deviation TS).
+  Assumes `r = 0.0`, no dividends, European calls. Auto-skipped when no
+  `VEV_*` products are in the dataset.
 - **Grid search** in two flavours:
   - single-stage (legacy `coarse_to_fine_grid` refinement),
   - explicit **two-stage coarse-to-fine** (`--ctf`): cheap noisy scan
     first, fine refinement only around the top fraction.
+- **Top-K re-evaluation before winner selection**: the fine-stage
+  top-10 candidates are re-run with `eval_paths_final` paths before
+  naming a winner, removing the extreme-value bias of `nlargest()`.
+  Disable with `--skip-final-reval` for smoke tests.
 - **Robust selection**: Pareto frontier on *(variance, mean profit)*
   plus a neighbourhood-stability re-ranking. Returns the top-2 robust
   parameter sets.
+- **Ad-hoc parameter-grid overrides** via `--param-grid 'KEY=v1,v2,...'`
+  (repeatable), with automatic type casting from `PARAM_SPEC` — lets
+  you test many thresholds without editing the trader file.
 - **Visualisation**: historical equity curve, MC fan chart, final-PnL
   distribution, variance/mean scatter, Pareto overlay, parameter
   heatmap, `mathematical_low` sensitivity plot, top-N ranking,
@@ -82,8 +102,8 @@ and a live progress bar).
 ## Installation
 
 ```bash
-git clone https://github.com/Diego-2510/backtesting-engine.git
-cd backtesting-engine
+git clone https://github.com/Diego-2510/prosperity-quant-lab.git
+cd prosperity-quant-lab
 
 python -m venv .venv
 source .venv/bin/activate
@@ -249,6 +269,20 @@ python round3_backtest_montecarlo.py \
 | `--ctf-top-frac F` | `0.10` | Top fraction of the coarse stage used for refinement. |
 | `--ctf-n-interp N` | `2` | Interpolation points inserted between numeric top values. |
 | `--n-workers N` | `-1` | Parallel worker processes (`-1` = all CPU cores, `1` = single-threaded). Requires `joblib` + `tqdm`. |
+| `--rank-metric METRIC` | `sharpe` | Ranking metric for grid results. One of `sharpe`, `mean_profit`, `profit_per_trade`, `objective_score`, `median_profit`. `sharpe` rewards consistency; `objective_score` (mean − λ·variance) is numerically brittle when variance is large. |
+| `--min-trades-filter F` | `5.0` | Drop grid configs whose `mean_trades_per_path` is below this value before ranking. |
+| `--mc-method {bootstrap,ou}` | `bootstrap` | Monte-Carlo generator. `ou` produces Ornstein-Uhlenbeck mean-reverting paths (ideal for structurally mean-reverting products). |
+| `--ou-theta F` / `--ou-mu F` / `--ou-sigma F` | auto | Global OU parameter defaults (mean-reversion speed, long-run mean, volatility). Any subset can be passed; missing keys fall back to per-product calibration. |
+| `--ou-override 'PROD:theta=X,mu=Y,sigma=Z'` | *(repeatable)* | Per-product OU override (any subset of keys). Overlays the globals. |
+| `--mc-method-override 'PROD=ou'` | *(repeatable)* | Per-product MC-method override (e.g. OU for mean-reverting products, bootstrap for trending/jumpy ones). |
+| `--position-limit 'PROD=N'` | *(repeatable)* | Per-product position-limit override; overrides the authoritative `KNOWN_POSITION_LIMITS` table for the listed products only. |
+| `--skip-stability` | *off* | Skip the top-K stability box-plot stage (~100 extra backtests). |
+| `--skip-extra-plots` | *off* | Skip heatmap / sensitivity / hit-map plots. Keeps equity curve, fan chart, Pareto, top-ranking, OU calibration, final-PnL distribution. |
+| `--lean-metrics` | *off* | Skip per-path drawdown / hit-rate / turnover / inventory-std / round-trips during grid evaluation (keeps only `final_pnl` + `n_trades`). |
+| `--skip-final-reval` | *off* | Skip the final top-K re-evaluation with `eval_paths_final`. |
+| `--param-grid 'KEY=v1,v2,...'` | *(repeatable)* | Override a trader parameter's grid with an arbitrary list. Types are cast from `PARAM_SPEC`. Use to test many thresholds without editing the trader file. Example: `--param-grid 'entry_sigma=0.75,1.0,1.25,1.5,2.0' --param-grid 'window=20,40,60,80,100'`. |
+| `--tte-base-days N` | `8` | Calendar days until voucher expiry at `day=0, timestamp=0` (Prosperity-4 Round 3 dataset = 8). The BS input is `T_years = (tte_base_days − day − timestamp/1e6) / 365`. |
+| `--skip-vol-smile` | *off* | Skip the VEV voucher volatility-smile diagnostics. Auto-skipped when no `VEV_*` / `VELVETFRUIT_EXTRACT_VOUCHER_*` products are in the dataset. |
 
 ## Output artifacts
 
@@ -270,6 +304,12 @@ Everything lands in `--out-dir`:
 | `plot_heatmap_<k1>_vs_<k2>.png` | Parameter heatmap for the 2 most informative keys. |
 | `plot_sensitivity_mathematical_low.png` | Sensitivity on the `mathematical_low` floor. |
 | `plot_stability_topK.png` | Distribution of final PnL per MC path for the top-5. |
+| `plot_ou_calibration.png` | Per-product OU fit diagnostics (only when `--mc-method ou` or an `--ou-override` is active). |
+| `vol_smile_per_tick.csv` | Per-(day, timestamp, strike) row with market IV, moneyness `m_t`, smile IV, theoretical BS price, IV deviation, price deviation. Only when VEV products are present. |
+| `vol_smile_fit.json` | Parabola coefficients `[a, b, c]` for `IV_hat(m_t) = a·m² + b·m + c`, plus the BS assumptions (`r=0`, no dividends), fit size, and ranges. |
+| `plot_vol_smile_scatter.png` | IV vs moneyness scatter with fitted parabola, one colour per strike (figure 6a). |
+| `plot_iv_deviation_ts.png` | Time series of `market_IV − smile_IV` per strike (figure 6b). |
+| `plot_price_deviation_ts.png` | Time series of `market_price − BS_theo(smile_IV)` per strike (figure 6c). |
 
 ## How the pieces fit together
 
@@ -317,12 +357,13 @@ Sections in the script (numbered comments at the top of each):
 4. Prosperity-compatible fill engine.
 5. Trader wrapper (external + default market maker).
 6. Feature engineering + diagnostics.
-7. Monte-Carlo path generation.
-8. Parameter registry + (two-stage) grid search.
-9. Backtest core + metrics.
-10. Pareto frontier + robust top-2 selection.
-11. Visualisation.
-12. Main pipeline.
+7. Monte-Carlo path generation (bootstrap + OU).
+8. Parameter registry + (two-stage) grid search + `--param-grid` overrides.
+9. Backtest core + metrics (EXACT + APPROX with round-trip PnL attribution).
+10. Pareto frontier + robust top-2 selection + final top-K re-evaluation.
+11. Black-Scholes + volatility-smile diagnostics (Round 3 vouchers).
+12. Visualisation.
+13. Main pipeline.
 
 ## Performance tips
 
@@ -376,6 +417,52 @@ bump to `2` only when a parameter is clearly under-resolved, and reserve
 `3` for the very last submission-candidate sweep. A full Round-3 baseline
 with 400 coarse × 1 400 fine combos, 10 products simulated, `n-eval=15`,
 and `--n-workers -1` finishes under 15 minutes on a 16-core laptop.
+
+## Black-Scholes + volatility-smile diagnostics
+
+When the dataset contains `VEV_*` or `VELVETFRUIT_EXTRACT_VOUCHER_*`
+products, the pipeline automatically runs a dedicated Round-3 diagnostic
+block before parameter search. It extracts an implied-volatility surface
+from the voucher mids, fits a quadratic smile in moneyness space, and
+writes the five artefacts listed above.
+
+### Assumptions (per user spec)
+
+- `r = 0.0` (annualized, continuously compounded risk-free rate).
+- `q = 0.0` (no dividends).
+- European calls, no early exercise.
+- **TTE semantics are strictly separated** — never mix the two:
+  - `TTE_days = tte_base_days − day − timestamp/1e6` (calendar days).
+  - `T_years = TTE_days / 365` (the Black-Scholes input).
+  - `m_t    = log(K / S) / sqrt(T_years)` (moneyness).
+- Only voucher rows with `extrinsic = market_price − max(S−K, 0) > 0.5`
+  enter the smile fit. This drops pure-intrinsic deep-ITM rows
+  (VEV_4000/4500 at mid ≈ S−K) and floored deep-OTM rows
+  (VEV_6000/6500 at mid ≈ 0.50).
+
+### IV solver
+
+Newton-Raphson in `(1e-4, 5.0)` with bisection fallback, minimum 10
+valid points required for the degree-2 polyfit. Solver returns `None`
+on pathological prices (below intrinsic or above the high-σ bound) and
+those rows are dropped before the fit.
+
+### Reusing the fit in a trader
+
+The parabola coefficients (`[a, b, c]`, highest-degree-first) are
+written to `vol_smile_fit.json`. A Prosperity trader can reuse them
+as structural IV estimates:
+
+```python
+# inside trader.run()
+m_t   = math.log(K / S) / math.sqrt(T_years)
+iv_hat = a * m_t * m_t + b * m_t + c      # smile IV for this K
+fair   = bs_call(S, K, T_years, iv_hat)    # theoretical BS price
+spread = market_price - fair               # mean-reverting around 0
+```
+
+This is exactly the contract used by `mean_reversion_options.py`
+(Round 3 mean-reverter on the option/fair spread).
 
 ## Known limitations
 
