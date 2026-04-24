@@ -117,9 +117,28 @@ DEFAULT_POSITION_LIMIT = 50  # ASSUMPTION: fallback only when data yields no lim
 # used when the CSV files belong to those products -- inferring from observed
 # order-book volume drastically over-estimates limits for small-cap products.
 KNOWN_POSITION_LIMITS: Dict[str, int] = {
-    # --- Prosperity 4 (authoritative from Prosperity.txt) ---
+    # --- Prosperity 4 Round 1 (authoritative from Prosperity.txt) ---
     "ASH_COATED_OSMIUM": 80,
     "INTARIAN_PEPPER_ROOT": 80,
+    # --- Prosperity 4 Round 3 (team analysis in BRIEF_EQUIPE_ROUND3.md,
+    # consistent with the P3 voucher structure -- VELVETFRUIT_EXTRACT plays
+    # the role of VOLCANIC_ROCK, VEV_* are the call vouchers). These are
+    # working values; if the official P4 limits differ, override via
+    # --position-limit PRODUCT=N. ASSUMPTION so long as Prosperity.txt does
+    # not yet list the Round 3 limits. ---
+    "VELVETFRUIT_EXTRACT": 400,
+    "VEV_4000": 200,
+    "VEV_4500": 200,
+    "VEV_5000": 200,
+    "VEV_5100": 200,
+    "VEV_5200": 200,
+    "VEV_5300": 200,
+    "VEV_5400": 200,
+    "VEV_5500": 200,
+    "VEV_6000": 200,
+    "VEV_6500": 200,
+    "HYDROGEL_PACK": 75,  # ASSUMPTION: no official reference yet; sized
+                          # like MAGNIFICENT_MACARONS (P3 auxiliary product).
     # --- Prosperity 3 2024 (from FrankfurtHedgehogs reference) ---
     "RAINFOREST_RESIN": 50,
     "KELP": 50,
