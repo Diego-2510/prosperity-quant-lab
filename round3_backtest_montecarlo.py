@@ -2722,7 +2722,7 @@ def build_vol_smile_table(
     prices_df: pd.DataFrame,
     tte_base_days: int = DEFAULT_TTE_BASE_DAYS,
     days_per_year: int = DAYS_PER_YEAR,
-    min_extrinsic: float = 0.5,
+    min_extrinsic: float = 0.0,
     min_T: float = 1e-6,
 ) -> pd.DataFrame:
     """Per-tick IV + moneyness table for every voucher in prices_df.
@@ -2768,10 +2768,12 @@ def build_vol_smile_table(
         T_years = np.maximum(tte_days, 0.0) / days_per_year
         merged["TTE_days"] = tte_days
         merged["T_years"] = T_years
-        # Keep only ticks with meaningful extrinsic value AND T > 0.
+        # Keep ticks with non-negative extrinsic AND T > 0. Note: deep-OTM
+        # options often sit at the 0.5 tick floor (extrinsic == 0.5 exactly),
+        # so the comparison is >= rather than > to keep them.
         intrinsic = np.maximum(merged["S"].to_numpy() - merged["K"].to_numpy(), 0.0)
         extrinsic = merged["market_price"].to_numpy() - intrinsic
-        mask = (T_years > min_T) & (extrinsic > min_extrinsic)
+        mask = (T_years > min_T) & (extrinsic >= min_extrinsic)
         merged = merged.loc[mask].reset_index(drop=True)
         if merged.empty:
             continue
@@ -2803,14 +2805,22 @@ def build_vol_smile_table(
 
 def fit_vol_smile_parabola(
     smile_table: pd.DataFrame,
+    fit_m_min: float = -1.8,
+    fit_m_max: float = 1.8,
 ) -> Tuple[Optional[np.ndarray], pd.DataFrame]:
     """Fit IV ~ a*m^2 + b*m + c on the IV/moneyness table.
+
+    Deep ITM/OTM ticks (|m_t| outside [fit_m_min, fit_m_max]) are excluded
+    from the regression because their IVs are numerically unreliable
+    (low vega for deep ITM, tick-floor pricing for deep OTM). They are
+    still kept in the returned table so the scatter plot shows them.
 
     Augments ``smile_table`` with:
         smile_IV          : fitted v_hat at each tick's m_t
         iv_deviation      : IV - smile_IV      (figure 6b signal)
         bs_theo_price     : BS(S, K, T, smile_IV, r=0)
         price_deviation   : market_price - bs_theo_price   (figure 6c signal)
+        in_fit_window     : bool, True if the row was used in the regression
     Returns (coeffs, augmented_table). coeffs=None if fit failed.
     """
     if smile_table.empty:
@@ -2818,14 +2828,27 @@ def fit_vol_smile_parabola(
     m = smile_table["m_t"].to_numpy()
     iv = smile_table["IV"].to_numpy()
     finite = np.isfinite(m) & np.isfinite(iv)
-    if finite.sum() < 10:
-        print("[VOL-SMILE] Too few valid IV points for a degree-2 fit.")
-        return None, smile_table
+    in_window = finite & (m >= fit_m_min) & (m <= fit_m_max)
+    if in_window.sum() < 10:
+        print(f"[VOL-SMILE] Too few valid IV points in fit window "
+              f"[{fit_m_min}, {fit_m_max}] (got {int(in_window.sum())}); "
+              f"falling back to all finite points.")
+        in_window = finite
+        if in_window.sum() < 10:
+            print("[VOL-SMILE] Too few valid IV points for a degree-2 fit.")
+            return None, smile_table
     try:
-        coeffs = np.polyfit(m[finite], iv[finite], deg=2)
+        coeffs = np.polyfit(m[in_window], iv[in_window], deg=2)
     except Exception as exc:
         print(f"[VOL-SMILE] polyfit failed: {exc}")
         return None, smile_table
+    n_total = int(finite.sum())
+    n_used = int(in_window.sum())
+    n_excl = n_total - n_used
+    if n_excl > 0:
+        print(f"[VOL-SMILE] parabola fit: {n_used}/{n_total} points used "
+              f"({n_excl} deep ITM/OTM excluded, |m_t| outside "
+              f"[{fit_m_min}, {fit_m_max}])")
     poly = np.poly1d(coeffs)
     smile_table = smile_table.copy()
     smile_table["smile_IV"] = poly(smile_table["m_t"].to_numpy())
@@ -2840,6 +2863,12 @@ def fit_vol_smile_parabola(
         theo[i] = bs_call_price(S_arr[i], K_arr[i], T_arr[i], s, r=0.0)
     smile_table["bs_theo_price"] = theo
     smile_table["price_deviation"] = smile_table["market_price"] - smile_table["bs_theo_price"]
+    smile_table["in_fit_window"] = (
+        np.isfinite(smile_table["m_t"].to_numpy())
+        & np.isfinite(smile_table["IV"].to_numpy())
+        & (smile_table["m_t"].to_numpy() >= fit_m_min)
+        & (smile_table["m_t"].to_numpy() <= fit_m_max)
+    )
     return coeffs, smile_table
 
 
@@ -2851,11 +2880,21 @@ def plot_vol_smile_scatter(
         return
     fig, ax = plt.subplots(figsize=(11, 5))
     strikes = sorted(table["K"].unique())
-    cmap = plt.get_cmap("tab10")
+    cmap = plt.get_cmap("tab20")
+    has_window_col = "in_fit_window" in table.columns
     for i, k in enumerate(strikes):
         sub = table[table["K"] == k]
-        ax.scatter(sub["m_t"], sub["IV"], s=3, alpha=0.5,
-                   color=cmap(i % 10), label=f"strike={int(k)}")
+        if has_window_col:
+            in_w = sub[sub["in_fit_window"]]
+            out_w = sub[~sub["in_fit_window"]]
+            ax.scatter(in_w["m_t"], in_w["IV"], s=4, alpha=0.6,
+                       color=cmap(i % 20), label=f"strike={int(k)}")
+            if len(out_w) > 0:
+                ax.scatter(out_w["m_t"], out_w["IV"], s=4, alpha=0.25,
+                           color=cmap(i % 20), marker="x")
+        else:
+            ax.scatter(sub["m_t"], sub["IV"], s=4, alpha=0.5,
+                       color=cmap(i % 20), label=f"strike={int(k)}")
     # Parabola overlay on the observed moneyness range.
     m_min, m_max = table["m_t"].min(), table["m_t"].max()
     m_line = np.linspace(m_min, m_max, 400)
@@ -2920,12 +2959,18 @@ def run_vol_smile_analysis(
     out_dir: Path,
     tte_base_days: int = DEFAULT_TTE_BASE_DAYS,
     days_per_year: int = DAYS_PER_YEAR,
-    min_extrinsic: float = 0.5,
-) -> Optional[np.ndarray]:
-    """End-to-end: IV table -> parabola fit -> CSV + 3 plots.
+    min_extrinsic: float = 0.0,
+    strike_groups: Optional[List[Tuple[str, List[int]]]] = None,
+) -> Optional[Dict[str, np.ndarray]]:
+    """End-to-end: IV table -> parabola fit(s) -> CSV + plots.
 
-    Returns the parabola coefficients [a, b, c] for downstream traders, or
-    None if there is not enough data to fit (e.g. no VEV products present).
+    If ``strike_groups`` is provided as a list of (label, [strikes]) pairs, an
+    independent parabola is fit per group (e.g. ATM core vs. wings), each
+    with its own scatter PNG and JSON entry. The 'all' fit on the full table
+    is always produced as a baseline.
+
+    Returns a dict {group_label -> coeffs}, or None if no IVs could be
+    computed at all.
     """
     print(f"[VOL-SMILE] computing IV + moneyness table "
           f"(tte_base_days={tte_base_days}, days_per_year={days_per_year}, "
@@ -2936,14 +2981,65 @@ def run_vol_smile_analysis(
     )
     if table.empty:
         return None
-    coeffs, table = fit_vol_smile_parabola(table)
-    if coeffs is None:
+    coeffs_all, table = fit_vol_smile_parabola(table)
+    if coeffs_all is None:
         return None
-    print(f"[VOL-SMILE] parabola coeffs (a, b, c) = "
-          f"[{coeffs[0]:.6f}, {coeffs[1]:.6f}, {coeffs[2]:.6f}]  "
-          f"(fit on {len(table)} ticks)")
-    # Artefacts.
+    print(f"[VOL-SMILE] [all] parabola coeffs (a, b, c) = "
+          f"[{coeffs_all[0]:.6f}, {coeffs_all[1]:.6f}, {coeffs_all[2]:.6f}]  "
+          f"(fit on {int(table['in_fit_window'].sum())} ticks)")
+
+    # -- Baseline 'all' artefacts (back-compat).
     table.to_csv(out_dir / "vol_smile_per_tick.csv", index=False)
+    plot_vol_smile_scatter(table, coeffs_all, out_dir / "plot_vol_smile_scatter.png")
+    plot_iv_deviation_ts(table, out_dir / "plot_iv_deviation_ts.png")
+    plot_price_deviation_ts(table, out_dir / "plot_price_deviation_ts.png")
+
+    fits: Dict[str, np.ndarray] = {"all": np.asarray(coeffs_all)}
+    fit_meta: Dict[str, Dict[str, Any]] = {
+        "all": {
+            "strikes": sorted(int(k) for k in table["K"].unique()),
+            "n_ticks": int(len(table)),
+            "n_fit": int(table["in_fit_window"].sum()),
+            "coeffs_highest_first": [float(x) for x in coeffs_all],
+            "m_t_range": [float(table["m_t"].min()), float(table["m_t"].max())],
+            "IV_range": [float(table["IV"].min()), float(table["IV"].max())],
+        }
+    }
+
+    # -- Per-group parabolas.
+    if strike_groups:
+        for label, strikes in strike_groups:
+            label_safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(label)).strip("_") or "group"
+            strikes_set = {int(k) for k in strikes}
+            sub = table[table["K"].isin(strikes_set)].copy()
+            if sub.empty:
+                print(f"[VOL-SMILE] [{label}] no rows for strikes {sorted(strikes_set)}; skipping group.")
+                continue
+            # Drop the prior 'all' fit columns so the per-group fit re-augments cleanly.
+            sub = sub.drop(columns=["smile_IV", "iv_deviation", "bs_theo_price",
+                                    "price_deviation", "in_fit_window"], errors="ignore")
+            coeffs_g, sub_aug = fit_vol_smile_parabola(sub)
+            if coeffs_g is None:
+                print(f"[VOL-SMILE] [{label}] fit failed; skipping group.")
+                continue
+            n_fit_g = int(sub_aug["in_fit_window"].sum())
+            print(f"[VOL-SMILE] [{label}] strikes={sorted(strikes_set)}  "
+                  f"coeffs (a, b, c) = [{coeffs_g[0]:.6f}, {coeffs_g[1]:.6f}, {coeffs_g[2]:.6f}]  "
+                  f"(fit on {n_fit_g} ticks)")
+            sub_aug.to_csv(out_dir / f"vol_smile_per_tick_{label_safe}.csv", index=False)
+            plot_vol_smile_scatter(
+                sub_aug, coeffs_g, out_dir / f"plot_vol_smile_scatter_{label_safe}.png"
+            )
+            fits[label_safe] = np.asarray(coeffs_g)
+            fit_meta[label_safe] = {
+                "strikes": sorted(int(k) for k in sub_aug["K"].unique()),
+                "n_ticks": int(len(sub_aug)),
+                "n_fit": n_fit_g,
+                "coeffs_highest_first": [float(x) for x in coeffs_g],
+                "m_t_range": [float(sub_aug["m_t"].min()), float(sub_aug["m_t"].max())],
+                "IV_range": [float(sub_aug["IV"].min()), float(sub_aug["IV"].max())],
+            }
+
     with open(out_dir / "vol_smile_fit.json", "w") as f:
         json.dump({
             "tte_base_days": tte_base_days,
@@ -2951,15 +3047,14 @@ def run_vol_smile_analysis(
             "min_extrinsic": min_extrinsic,
             "r": 0.0,
             "dividend_yield": 0.0,
-            "parabola_coeffs_highest_first": [float(x) for x in coeffs],
+            # Back-compat: top-level fields mirror the 'all' fit.
+            "parabola_coeffs_highest_first": [float(x) for x in coeffs_all],
             "n_ticks": int(len(table)),
             "m_t_range": [float(table["m_t"].min()), float(table["m_t"].max())],
             "IV_range": [float(table["IV"].min()), float(table["IV"].max())],
+            "groups": fit_meta,
         }, f, indent=2)
-    plot_vol_smile_scatter(table, coeffs, out_dir / "plot_vol_smile_scatter.png")
-    plot_iv_deviation_ts(table, out_dir / "plot_iv_deviation_ts.png")
-    plot_price_deviation_ts(table, out_dir / "plot_price_deviation_ts.png")
-    return coeffs
+    return fits
 
 
 def _single_day_keys(
@@ -3013,6 +3108,7 @@ def run_pipeline(
     skip_vol_smile: bool = False,
     sim_spread_overrides: Optional[Dict[str, float]] = None,
     sim_spread_mode: str = "auto",
+    vol_smile_groups: Optional[List[Tuple[str, List[int]]]] = None,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -3053,7 +3149,17 @@ def run_pipeline(
         # ASSUMPTION: no data found. Generate a synthetic 3-day, 1-product
         # dataset so the pipeline still runs end-to-end and the Monte-Carlo
         # section remains testable.
-        print("[WARN] No Prosperity data found. Falling back to synthetic data (3 days, 1 product).")
+        print("")
+        print("=" * 78)
+        print("[ERROR] No Prosperity price CSVs were found under --data-dir.")
+        print(f"        data_dir resolved to: {data_dir.resolve() if data_dir.exists() else data_dir}")
+        print(f"        exists={data_dir.exists()}  is_dir={data_dir.is_dir() if data_dir.exists() else False}")
+        print("        Expected files like  prices_round_<R>_day_<D>.csv  /  trades_round_<R>_day_<D>.csv")
+        print("        Falling back to a SYNTHETIC 1-product dataset ('SYNTH_PRODUCT').")
+        print("        Most external traders won't produce trades on SYNTH_PRODUCT, so grid CSVs")
+        print("        will be empty after --min-trades-filter. Re-run with a correct --data-dir.")
+        print("=" * 78)
+        print("")
         rng = np.random.default_rng(seed)
         days = []
         T = 1000
@@ -3082,6 +3188,7 @@ def run_pipeline(
                 print(f"[VOL-SMILE] detected {int(vev_mask.sum())} voucher rows -- running analysis")
                 run_vol_smile_analysis(
                     prices_df, out_dir=out_dir, tte_base_days=tte_base_days,
+                    strike_groups=vol_smile_groups,
                 )
             else:
                 print("[VOL-SMILE] no VEV_* / VELVETFRUIT_EXTRACT_VOUCHER_* products -- skipping")
@@ -3733,6 +3840,19 @@ def parse_args() -> argparse.Namespace:
                          "'PRODUCT=N' (repeatable, wins over the global value). "
                          "EXACT-fill mode ignores this flag entirely because it "
                          "already uses real historical L1 books.")
+    # Volatility-smile strike groups. Repeatable -- format LABEL=K1,K2,...
+    # Each group gets its own parabola fit, scatter PNG, and per-tick CSV in
+    # addition to the baseline 'all' fit. Useful when ATM vouchers and the
+    # wings live on different smiles (e.g. tick-floor pricing distorts deep
+    # OTM IVs). Example:
+    #   --smile-group core=5000,5100,5200,5300,5400,5500 \
+    #   --smile-group wings=4000,4500,6000,6500
+    ap.add_argument("--smile-group", action="append", default=[],
+                    help="Per-group volatility-smile fit, format "
+                         "'LABEL=K1,K2,...'. Repeatable. Each group produces "
+                         "its own parabola (a, b, c), scatter plot "
+                         "plot_vol_smile_scatter_<LABEL>.png, and per-tick CSV. "
+                         "The baseline 'all' fit is always produced too.")
     return ap.parse_args()
 
 
@@ -3800,6 +3920,38 @@ def _parse_kv_int_overrides(raw_list: List[str], label: str) -> Dict[str, int]:
         except ValueError:
             print(f"[WARN] Ignoring --{label} '{raw}': '{val}' is not an integer")
     return out
+
+
+def _parse_smile_groups(raw_list: List[str]) -> List[Tuple[str, List[int]]]:
+    """Parse repeated ``--smile-group LABEL=K1,K2,...`` flags.
+
+    Returns a list of (label, [strikes]) tuples, preserving CLI order.
+    Invalid tokens are skipped with a warning.
+    """
+    groups: List[Tuple[str, List[int]]] = []
+    for raw in raw_list:
+        if "=" not in raw:
+            print(f"[WARN] Ignoring --smile-group '{raw}': expected LABEL=K1,K2,...")
+            continue
+        label, vals = raw.split("=", 1)
+        label = label.strip()
+        strikes: List[int] = []
+        for tok in vals.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                strikes.append(int(float(tok)))
+            except ValueError:
+                print(f"[WARN] Ignoring strike '{tok}' in --smile-group '{raw}': not numeric")
+        if not label:
+            print(f"[WARN] Ignoring --smile-group '{raw}': empty label")
+            continue
+        if not strikes:
+            print(f"[WARN] Ignoring --smile-group '{raw}': no valid strikes")
+            continue
+        groups.append((label, strikes))
+    return groups
 
 
 def _parse_sim_spread(
@@ -4038,6 +4190,7 @@ if __name__ == "__main__":
             skip_vol_smile=args.skip_vol_smile,
             sim_spread_mode=_sim_mode,
             sim_spread_overrides=_sim_ovr,
+            vol_smile_groups=_parse_smile_groups(args.smile_group),
         )
     except Exception as e:
         traceback.print_exc()
