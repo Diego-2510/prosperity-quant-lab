@@ -2724,6 +2724,7 @@ def build_vol_smile_table(
     days_per_year: int = DAYS_PER_YEAR,
     min_extrinsic: float = 0.0,
     min_T: float = 1e-6,
+    include_strikes: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     """Per-tick IV + moneyness table for every voucher in prices_df.
 
@@ -2744,6 +2745,18 @@ def build_vol_smile_table(
     if not vouchers:
         print("[VOL-SMILE] No voucher products (VEV_*) found; skipping.")
         return pd.DataFrame()
+    available_strikes = sorted({int(k) for _, k in vouchers})
+    print(f"[VOL-SMILE] available strikes in data: {available_strikes}")
+    if include_strikes is not None:
+        wanted = {int(k) for k in include_strikes}
+        missing = sorted(wanted - set(available_strikes))
+        if missing:
+            print(f"[VOL-SMILE] [WARN] requested strikes not in data, ignored: {missing}")
+        vouchers = [(p, k) for p, k in vouchers if int(k) in wanted]
+        if not vouchers:
+            print("[VOL-SMILE] No vouchers left after --smile-strikes filter; skipping.")
+            return pd.DataFrame()
+        print(f"[VOL-SMILE] universe restricted to: {sorted(int(k) for _, k in vouchers)}")
 
     und = (prices_df[prices_df["product"] == underlying]
            [["day", "timestamp", "mid_price"]]
@@ -2961,6 +2974,8 @@ def run_vol_smile_analysis(
     days_per_year: int = DAYS_PER_YEAR,
     min_extrinsic: float = 0.0,
     strike_groups: Optional[List[Tuple[str, List[int]]]] = None,
+    include_strikes: Optional[List[int]] = None,
+    per_strike: bool = False,
 ) -> Optional[Dict[str, np.ndarray]]:
     """End-to-end: IV table -> parabola fit(s) -> CSV + plots.
 
@@ -2978,6 +2993,7 @@ def run_vol_smile_analysis(
     table = build_vol_smile_table(
         prices_df, tte_base_days=tte_base_days,
         days_per_year=days_per_year, min_extrinsic=min_extrinsic,
+        include_strikes=include_strikes,
     )
     if table.empty:
         return None
@@ -3006,9 +3022,15 @@ def run_vol_smile_analysis(
         }
     }
 
+    # -- Auto-expand: one group per individual strike if requested.
+    effective_groups: List[Tuple[str, List[int]]] = list(strike_groups or [])
+    if per_strike:
+        for k in sorted(int(x) for x in table["K"].unique()):
+            effective_groups.append((f"K{k}", [k]))
+
     # -- Per-group parabolas.
-    if strike_groups:
-        for label, strikes in strike_groups:
+    if effective_groups:
+        for label, strikes in effective_groups:
             label_safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(label)).strip("_") or "group"
             strikes_set = {int(k) for k in strikes}
             sub = table[table["K"].isin(strikes_set)].copy()
@@ -3109,6 +3131,8 @@ def run_pipeline(
     sim_spread_overrides: Optional[Dict[str, float]] = None,
     sim_spread_mode: str = "auto",
     vol_smile_groups: Optional[List[Tuple[str, List[int]]]] = None,
+    vol_smile_strikes: Optional[List[int]] = None,
+    vol_smile_per_strike: bool = False,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -3189,6 +3213,8 @@ def run_pipeline(
                 run_vol_smile_analysis(
                     prices_df, out_dir=out_dir, tte_base_days=tte_base_days,
                     strike_groups=vol_smile_groups,
+                    include_strikes=vol_smile_strikes,
+                    per_strike=vol_smile_per_strike,
                 )
             else:
                 print("[VOL-SMILE] no VEV_* / VELVETFRUIT_EXTRACT_VOUCHER_* products -- skipping")
@@ -3840,19 +3866,33 @@ def parse_args() -> argparse.Namespace:
                          "'PRODUCT=N' (repeatable, wins over the global value). "
                          "EXACT-fill mode ignores this flag entirely because it "
                          "already uses real historical L1 books.")
-    # Volatility-smile strike groups. Repeatable -- format LABEL=K1,K2,...
-    # Each group gets its own parabola fit, scatter PNG, and per-tick CSV in
-    # addition to the baseline 'all' fit. Useful when ATM vouchers and the
-    # wings live on different smiles (e.g. tick-floor pricing distorts deep
-    # OTM IVs). Example:
-    #   --smile-group core=5000,5100,5200,5300,5400,5500 \
-    #   --smile-group wings=4000,4500,6000,6500
+    # Volatility-smile selection. Three independent knobs that compose:
+    #   --smile-strikes K1,K2,...  filters the GLOBAL universe of strikes that
+    #       feed the smile table (also the baseline 'all' fit). Strikes not in
+    #       the list are dropped before any computation. Default: all strikes.
+    #   --smile-group LABEL=K1,K2,...  (repeatable) fits an extra parabola for
+    #       this subset. Strikes outside --smile-strikes are silently ignored.
+    #   --smile-per-strike  auto-adds one group per individual strike (handy
+    #       when you want every voucher's own fit and devation series).
+    # Examples:
+    #   --smile-strikes 5000,5100,5200,5300,5400,5500
+    #   --smile-group core=5000,5100,5200,5300,5400,5500 --smile-group wings=4000,4500,6000,6500
+    #   --smile-per-strike
+    ap.add_argument("--smile-strikes", type=str, default=None,
+                    help="Comma-separated list of voucher strikes to include "
+                         "in the smile analysis (e.g. '5000,5100,5200,5300,5400,5500'). "
+                         "Filters the universe BEFORE any fit, so the baseline "
+                         "'all' fit is also restricted. Default: all available strikes.")
     ap.add_argument("--smile-group", action="append", default=[],
                     help="Per-group volatility-smile fit, format "
                          "'LABEL=K1,K2,...'. Repeatable. Each group produces "
                          "its own parabola (a, b, c), scatter plot "
                          "plot_vol_smile_scatter_<LABEL>.png, and per-tick CSV. "
                          "The baseline 'all' fit is always produced too.")
+    ap.add_argument("--smile-per-strike", action="store_true",
+                    help="Auto-fit one parabola per individual strike (after "
+                         "--smile-strikes filtering). Equivalent to passing "
+                         "--smile-group K<strike>=<strike> for every strike.")
     return ap.parse_args()
 
 
@@ -3920,6 +3960,26 @@ def _parse_kv_int_overrides(raw_list: List[str], label: str) -> Dict[str, int]:
         except ValueError:
             print(f"[WARN] Ignoring --{label} '{raw}': '{val}' is not an integer")
     return out
+
+
+def _parse_smile_strikes(raw: Optional[str]) -> Optional[List[int]]:
+    """Parse the comma-separated ``--smile-strikes`` flag into a list of ints.
+
+    Returns None if the flag was not provided (i.e. include all strikes).
+    Invalid tokens are skipped with a warning; an empty result returns None.
+    """
+    if raw is None:
+        return None
+    out: List[int] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(int(float(tok)))
+        except ValueError:
+            print(f"[WARN] Ignoring strike '{tok}' in --smile-strikes: not numeric")
+    return out or None
 
 
 def _parse_smile_groups(raw_list: List[str]) -> List[Tuple[str, List[int]]]:
@@ -4191,6 +4251,8 @@ if __name__ == "__main__":
             sim_spread_mode=_sim_mode,
             sim_spread_overrides=_sim_ovr,
             vol_smile_groups=_parse_smile_groups(args.smile_group),
+            vol_smile_strikes=_parse_smile_strikes(args.smile_strikes),
+            vol_smile_per_strike=args.smile_per_strike,
         )
     except Exception as e:
         traceback.print_exc()
