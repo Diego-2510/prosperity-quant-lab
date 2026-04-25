@@ -165,6 +165,14 @@ TICK_STEP = 100
 # are available for the current backtest run.
 FILL_MODE = "APPROX"
 
+# Default simulated bid-ask spread (in ticks) used in APPROX-fill mode when no
+# per-product override is provided. Historically this was hardcoded to 2.0
+# (bid = floor(mid - 1), ask = ceil(mid + 1)); for products that genuinely
+# trade at much wider spreads (e.g. VEV vouchers ~ 4-12 ticks) this distorts
+# fill economics. Override per product via :func:`compute_mean_historical_spread`
+# or the ``--sim-spread`` CLI flag.
+DEFAULT_SIM_SPREAD = 2.0
+
 
 # =============================================================================
 # 1. DATAMODEL COMPATIBILITY LAYER
@@ -717,6 +725,34 @@ def load_external_trader(path: Path) -> Optional[Callable]:
 # =============================================================================
 # 6. FEATURE ENGINEERING
 # =============================================================================
+
+
+def compute_mean_historical_spread(
+    prices_df: pd.DataFrame,
+    fallback: float = DEFAULT_SIM_SPREAD,
+    min_spread: float = 1.0,
+) -> Dict[str, float]:
+    """Per-product mean of (ask_price_1 - bid_price_1) across the dataset.
+
+    Used to seed the simulated bid-ask spread of the APPROX-fill backtester.
+    Products without usable L1 quotes fall back to ``fallback`` (default 2.0).
+    Spreads below ``min_spread`` are clipped up so the simulated bid is always
+    strictly below the simulated ask after rounding.
+    """
+    out: Dict[str, float] = {}
+    if prices_df.empty:
+        return out
+    if not {"bid_price_1", "ask_price_1", "product"}.issubset(prices_df.columns):
+        return out
+    spread = (prices_df["ask_price_1"] - prices_df["bid_price_1"]).astype(float)
+    spread = spread.where(spread > 0)  # drop crossed/missing rows
+    grouped = spread.groupby(prices_df["product"]).mean()
+    for prod, val in grouped.items():
+        if pd.isna(val):
+            out[str(prod)] = float(fallback)
+        else:
+            out[str(prod)] = float(max(min_spread, val))
+    return out
 
 
 def build_feature_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
@@ -1501,13 +1537,18 @@ def run_backtest_on_series(
     position_limits: Dict[str, int],
     max_ticks: Optional[int] = None,
     market_trades_index: Optional[Dict[Tuple[int, int], Dict[str, List["Trade"]]]] = None,
+    sim_spread_by_product: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Run a single backtest pass.
 
     If ``historical_depths`` and ``ordered_keys`` are provided the run uses
     EXACT-fill mode against the real recorded order books. Otherwise it falls
     back to APPROX-fill mode against the per-product mid-price series, with a
-    synthetic order book at Bid=floor(mid-1) / Ask=ceil(mid+1).
+    synthetic order book centred on the mid. The simulated half-spread is
+    ``sim_spread_by_product[product] / 2`` (default :data:`DEFAULT_SIM_SPREAD`)
+    so a value of 2.0 reproduces the legacy ``floor(mid - 1) / ceil(mid + 1)``
+    behaviour while wider products (e.g. VEV vouchers) can use their measured
+    historical spread instead.
 
     If ``market_trades_index`` is provided (mapping (day, timestamp) ->
     {product: List[Trade]}), the trader receives populated ``market_trades``
@@ -1662,8 +1703,25 @@ def run_backtest_on_series(
         # product instead of a Python-level sum over a generator.
         if products and T > 0:
             mid_mat = np.vstack([clean[p][:T] for p in products])  # (P, T)
-            bid_mat = np.floor(mid_mat - 1.0).astype(np.int64)
-            ask_mat = np.ceil(mid_mat + 1.0).astype(np.int64)
+            # Per-product half-spread vector. ``sim_spread_by_product`` carries
+            # the FULL spread in ticks; halving it gives the offset applied to
+            # each side of the mid before rounding.
+            spread_map = sim_spread_by_product or {}
+            half_vec = np.array(
+                [
+                    max(0.5, float(spread_map.get(p, DEFAULT_SIM_SPREAD)) / 2.0)
+                    for p in products
+                ],
+                dtype=np.float64,
+            ).reshape(-1, 1)
+            bid_mat = np.floor(mid_mat - half_vec).astype(np.int64)
+            ask_mat = np.ceil(mid_mat + half_vec).astype(np.int64)
+            # Final safeguard: integer rounding can collapse the book to a
+            # crossed/zero spread when half_vec < 1 and mid is exactly on a
+            # tick boundary. Force a strict 1-tick separation in that case.
+            crossed = ask_mat <= bid_mat
+            if crossed.any():
+                ask_mat = np.where(crossed, bid_mat + 1, ask_mat)
         else:
             mid_mat = np.zeros((0, 0))
             bid_mat = ask_mat = np.zeros((0, 0), dtype=np.int64)
@@ -1886,6 +1944,7 @@ def _worker_init(
     have_exact: bool,
     seed: int,
     lean_metrics: bool = False,
+    sim_spread_by_product: Optional[Dict[str, float]] = None,
 ) -> None:
     """Initializer run ONCE per worker process. Stashes the large per-run
     context into the process-global dict so per-job payloads are tiny.
@@ -1897,6 +1956,7 @@ def _worker_init(
         "hist_mids": hist_mids,
         "historical_depths": historical_depths,
         "ordered_keys": ordered_keys,
+        "sim_spread_by_product": sim_spread_by_product,
         "position_limits": position_limits,
         "max_ticks": max_ticks,
         "market_trades_index": market_trades_index,
@@ -1926,6 +1986,7 @@ def _eval_combo_worker_shared(params: Dict[str, Any], n_eval: int) -> Optional[D
         st["max_ticks"], st["market_trades_index"], n_eval, st["n_paths"],
         st["skip_hist_in_grid"], st["risk_lambda"], st["have_exact"], st["seed"],
         st.get("lean_metrics", False),
+        st.get("sim_spread_by_product"),
     )
 
 
@@ -1938,6 +1999,7 @@ def _eval_single_path_worker_shared(params: Dict[str, Any], path_idx: int) -> Di
     return _eval_single_path_worker(
         st["trader_path_str"], params, st["mc_paths"], path_idx,
         st["position_limits"], st["max_ticks"],
+        st.get("sim_spread_by_product"),
     )
 
 
@@ -1972,6 +2034,7 @@ def _eval_combo_worker(
     have_exact: bool,
     seed: int,
     lean_metrics: bool = False,
+    sim_spread_by_product: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Evaluate ONE parameter combination across ``n_eval`` Monte-Carlo paths
     (and optionally one historical EXACT backtest). Designed to run inside a
@@ -1993,6 +2056,7 @@ def _eval_combo_worker(
                 position_limits=position_limits,
                 max_ticks=max_ticks,
                 market_trades_index=market_trades_index if have_exact else None,
+                sim_spread_by_product=sim_spread_by_product,
             )
         else:
             hist_res = dict(final_pnl=0.0, max_drawdown=0.0, hit_rate=0.0,
@@ -2018,6 +2082,7 @@ def _eval_combo_worker(
                 historical_depths=None, ordered_keys=None,
                 position_limits=position_limits,
                 max_ticks=max_ticks,
+                sim_spread_by_product=sim_spread_by_product,
             )
             profits.append(r["final_pnl"])
             trade_counts.append(r["n_trades"])
@@ -2069,6 +2134,7 @@ def _eval_single_path_worker(
     path_idx: int,
     position_limits: Dict[str, int],
     max_ticks: Optional[int],
+    sim_spread_by_product: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Evaluate ONE MC path for a fixed parameter combo. Used by the fan-chart
     and stability visualization stages so they also benefit from parallelism.
@@ -2081,6 +2147,7 @@ def _eval_single_path_worker(
         historical_depths=None, ordered_keys=None,
         position_limits=position_limits,
         max_ticks=max_ticks,
+        sim_spread_by_product=sim_spread_by_product,
     )
     return {"final_pnl": r["final_pnl"], "equity_curve": r["equity_curve"]}
 
@@ -2944,6 +3011,8 @@ def run_pipeline(
     param_grid_overrides: Optional[Dict[str, List[Any]]] = None,
     tte_base_days: int = DEFAULT_TTE_BASE_DAYS,
     skip_vol_smile: bool = False,
+    sim_spread_overrides: Optional[Dict[str, float]] = None,
+    sim_spread_mode: str = "auto",
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -3031,6 +3100,50 @@ def run_pipeline(
     # -- Position limits.
     position_limits = infer_position_limits(prices_df, overrides=position_limit_overrides)
     print(f"[INFO] inferred position limits: {position_limits}")
+
+    # -- Simulated bid-ask spread (APPROX-fill mode).
+    # Three modes:
+    #   "auto"    -> per-product mean of historical (ask_price_1 - bid_price_1),
+    #                fallback DEFAULT_SIM_SPREAD when L1 quotes are missing.
+    #   "legacy"  -> uniform DEFAULT_SIM_SPREAD = 2.0 for every product
+    #                (reproduces the original floor(mid-1)/ceil(mid+1) book).
+    #   "global"  -> uniform value supplied via --sim-spread N (single number).
+    # Per-product overrides (--sim-spread PRODUCT=N) always take precedence.
+    sim_spread_mode_norm = (sim_spread_mode or "auto").lower()
+    if sim_spread_mode_norm == "legacy":
+        sim_spread_by_product = {
+            str(p): float(DEFAULT_SIM_SPREAD)
+            for p in prices_df["product"].unique()
+        }
+    else:
+        sim_spread_by_product = compute_mean_historical_spread(prices_df)
+        # Backfill products that weren't in the historical frame yet (rare,
+        # e.g. when MC paths get generated for products lacking L1 quotes).
+        for p in position_limits.keys():
+            sim_spread_by_product.setdefault(str(p), float(DEFAULT_SIM_SPREAD))
+    if sim_spread_overrides:
+        # A bare numeric value on --sim-spread is encoded under the special
+        # '__GLOBAL__' key by _parse_sim_spread; expand it across every
+        # known product BEFORE per-product overrides land so the latter win.
+        ovr = dict(sim_spread_overrides)
+        global_val = ovr.pop("__GLOBAL__", None)
+        if global_val is not None:
+            gv = float(global_val)
+            for p in list(sim_spread_by_product.keys()):
+                sim_spread_by_product[p] = gv
+            for p in position_limits.keys():
+                sim_spread_by_product[str(p)] = gv
+            sim_spread_mode_norm = "global"
+        for k, v in ovr.items():
+            sim_spread_by_product[str(k)] = float(v)
+    if sim_spread_by_product:
+        # Compact log: show first ~6 products to keep output readable.
+        preview = ", ".join(
+            f"{p}={sim_spread_by_product[p]:.2f}"
+            for p in list(sim_spread_by_product.keys())[:6]
+        )
+        more = f" (+{len(sim_spread_by_product)-6} more)" if len(sim_spread_by_product) > 6 else ""
+        print(f"[INFO] sim spreads ({sim_spread_mode_norm}): {preview}{more}")
 
     # -- Historical depths (EXACT fill when possible).
     # Skip the expensive prices_to_order_depths build (~18s for 90k rows)
@@ -3211,6 +3324,7 @@ def run_pipeline(
         have_exact,
         seed,
         lean_metrics,
+        sim_spread_by_product,
     )
 
     def _make_batch_runner(n_eval: int) -> Callable[[List[Dict[str, Any]]], pd.DataFrame]:
@@ -3408,6 +3522,7 @@ def run_pipeline(
             position_limits=position_limits,
             max_ticks=max_ticks,
             market_trades_index=market_trades_index if have_exact else None,
+            sim_spread_by_product=sim_spread_by_product,
         )
         plot_equity_curve(hist_res["equity_curve"], out_dir / "plot_equity_curve.png")
 
@@ -3604,6 +3719,20 @@ def parse_args() -> argparse.Namespace:
                          "(IV-vs-moneyness scatter, IV deviation TS, price "
                          "deviation TS). Auto-skipped when no VEV_* products "
                          "are in the dataset.")
+    # Simulated bid-ask spread (APPROX-fill mode only). Repeatable -- accepts:
+    #   AUTO            -> per-product mean of historical L1 spread (default).
+    #   LEGACY          -> uniform 2.0 (the original floor(mid-1)/ceil(mid+1)).
+    #   N               -> uniform float for every product (e.g. --sim-spread 6).
+    #   PRODUCT=N       -> override one product (e.g. --sim-spread VEV_5500=4).
+    # Multiple invocations are merged; per-product overrides win over a global N.
+    ap.add_argument("--sim-spread", action="append", default=[],
+                    help="APPROX-fill simulated bid-ask spread in ticks. "
+                         "Accepts 'AUTO' (default: mean historical spread per "
+                         "product), 'LEGACY' (uniform 2.0 -- pre-fix behaviour), "
+                         "a global float (e.g. '--sim-spread 6'), or per-product "
+                         "'PRODUCT=N' (repeatable, wins over the global value). "
+                         "EXACT-fill mode ignores this flag entirely because it "
+                         "already uses real historical L1 books.")
     return ap.parse_args()
 
 
@@ -3671,6 +3800,50 @@ def _parse_kv_int_overrides(raw_list: List[str], label: str) -> Dict[str, int]:
         except ValueError:
             print(f"[WARN] Ignoring --{label} '{raw}': '{val}' is not an integer")
     return out
+
+
+def _parse_sim_spread(
+    raw_list: List[str],
+) -> Tuple[str, Dict[str, float]]:
+    """Parse the repeatable ``--sim-spread`` flag into ``(mode, overrides)``.
+
+    Mode is one of:
+      * ``"auto"`` -- per-product mean historical spread (default).
+      * ``"legacy"`` -- uniform :data:`DEFAULT_SIM_SPREAD` (2.0).
+      * ``"global"`` -- a uniform float supplied as a bare positional value;
+        the value lives in ``overrides["__GLOBAL__"]`` and is applied to every
+        product after the auto/legacy seed.
+
+    Per-product overrides (``PRODUCT=N``) are always merged into the dict and
+    win over both the mode seed and any ``__GLOBAL__`` value.
+    """
+    mode = "auto"
+    overrides: Dict[str, float] = {}
+    for raw in raw_list or []:
+        token = raw.strip()
+        if not token:
+            continue
+        upper = token.upper()
+        if upper in ("AUTO", "LEGACY"):
+            mode = upper.lower()
+            continue
+        if "=" in token:
+            prod, val = token.split("=", 1)
+            prod = prod.strip()
+            try:
+                overrides[prod] = float(val.strip())
+            except ValueError:
+                print(f"[WARN] Ignoring --sim-spread '{raw}': '{val}' is not numeric")
+            continue
+        # Bare numeric value -> global uniform spread.
+        try:
+            overrides["__GLOBAL__"] = float(token)
+        except ValueError:
+            print(f"[WARN] Ignoring --sim-spread '{raw}': not a number, AUTO, LEGACY, or PRODUCT=N")
+    # The '__GLOBAL__' sentinel (if present) is left in `overrides` and
+    # expanded by run_pipeline across every product before per-product
+    # overrides are merged on top.
+    return mode, overrides
 
 
 def _parse_kv_str_overrides(
@@ -3823,6 +3996,7 @@ def _apply_param_grid_overrides(
 
 if __name__ == "__main__":
     args = parse_args()
+    _sim_mode, _sim_ovr = _parse_sim_spread(args.sim_spread)
     try:
         run_pipeline(
             data_dir=args.data_dir,
@@ -3862,6 +4036,8 @@ if __name__ == "__main__":
             param_grid_overrides=_parse_param_grid_overrides(args.param_grid),
             tte_base_days=args.tte_base_days,
             skip_vol_smile=args.skip_vol_smile,
+            sim_spread_mode=_sim_mode,
+            sim_spread_overrides=_sim_ovr,
         )
     except Exception as e:
         traceback.print_exc()
