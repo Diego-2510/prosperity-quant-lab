@@ -1272,6 +1272,15 @@ def coarse_to_fine_grid(
     coarse = build_grid(coarse_spec)
     coarse_res = run_batch(coarse)
 
+    if coarse_res.empty or "objective_score" not in coarse_res.columns:
+        # Defensive fallback: every coarse combo crashed in its worker (often
+        # the upstream cause is n_paths=0 with no historical fallback, or a
+        # broken trader). Without this guard nlargest() would raise
+        # KeyError('objective_score'). Returning the empty frame lets the
+        # caller surface a clean error rather than a stack trace.
+        print("[WARN] coarse-to-fine: coarse stage produced no scored rows. "
+              "Skipping fine refinement and returning empty result.")
+        return coarse_res
     top = coarse_res.nlargest(top_k, "objective_score")
     fine_combos = []
     for _, row in top.iterrows():
@@ -2046,6 +2055,14 @@ def _eval_combo_worker(
     try:
         trader_cls = _worker_get_trader_cls(trader_path_str)
 
+        # If no MC paths were generated (e.g. --n-paths 0 for diagnostic
+        # runs), force the historical leg to run even when skip_hist_in_grid
+        # is True. Otherwise the combo would have nothing to score on, the
+        # row would carry no 'objective_score' field, and the coarse-to-fine
+        # selector would crash on the empty/columnless DataFrame.
+        if n_paths <= 0 and hist_mids is not None:
+            skip_hist_in_grid = False
+
         # Optional historical backtest (disabled by default for grid runs).
         if not skip_hist_in_grid and hist_mids is not None:
             hist_res = run_backtest_on_series(
@@ -2073,8 +2090,17 @@ def _eval_combo_worker(
         turnovers: List[float] = []
         inv_stds: List[float] = []
         rng = np.random.default_rng(seed + hash(tuple(sorted(params.items()))) % 2**31)
-        n_eval_eff = max(1, min(n_paths, n_eval))
-        idx = rng.choice(n_paths, size=n_eval_eff, replace=False)
+        # Guard against n_paths=0 (no Monte-Carlo paths generated): we cannot
+        # sample MC indices, so the combo is evaluated solely on the historical
+        # leg above. Without this guard, np.random.choice(0, size>=1) raises
+        # 'a must be a positive integer unless no samples are taken' and every
+        # combo crashes -> empty grid result -> KeyError('objective_score').
+        if n_paths <= 0:
+            n_eval_eff = 0
+            idx = np.array([], dtype=int)
+        else:
+            n_eval_eff = max(1, min(n_paths, n_eval))
+            idx = rng.choice(n_paths, size=n_eval_eff, replace=False)
         for i in idx:
             mids = {p: mc_paths[p][i] for p in products}
             r = run_backtest_on_series(
@@ -2102,7 +2128,33 @@ def _eval_combo_worker(
 
         profits_arr = np.array(profits)
         trades_arr = np.array(trade_counts)
-        m = aggregate_path_metrics(profits_arr, risk_lambda, per_path_trades=trades_arr)
+        # When no MC paths are available, anchor the metrics on the historical
+        # leg so 'objective_score' (and friends) still exist. Without this
+        # branch, aggregate_path_metrics returns {} for an empty array and the
+        # row leaves the worker missing every scoring column.
+        if profits_arr.size == 0:
+            hist_pnl = float(hist_res.get("final_pnl", 0.0))
+            hist_trades = float(hist_res.get("n_trades", 0)) if isinstance(hist_res, dict) else 0.0
+            # Schema must match aggregate_path_metrics() exactly so downstream
+            # code (Pareto, plots, top-N CSV) finds 'variance', 'profit_std',
+            # 'VaR_5', 'CVaR_5', 'worst_path_profit', etc.
+            m = {
+                "total_profit": hist_pnl,
+                "mean_profit": hist_pnl,
+                "median_profit": hist_pnl,
+                "profit_std": 0.0,
+                "variance": 0.0,
+                "VaR_5": hist_pnl,
+                "CVaR_5": hist_pnl,
+                "worst_path_profit": hist_pnl,
+                "objective_score": hist_pnl,
+                "sharpe": 0.0,
+                "profit_per_trade": (hist_pnl / hist_trades) if hist_trades > 0 else 0.0,
+                "mean_trades_per_path": hist_trades,
+                "median_trades_per_path": hist_trades,
+            }
+        else:
+            m = aggregate_path_metrics(profits_arr, risk_lambda, per_path_trades=trades_arr)
         # Prefer MC-path aggregates when the historical backtest was skipped
         # (grid mode). Fall back to hist_res only if no MC paths executed.
         def _mean(xs: List[float]) -> float:
