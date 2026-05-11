@@ -13,7 +13,7 @@ A full-cycle quantitative research and trading systems project built for the [IM
 |---|---|
 | Global rank | **#326** |
 | Algo rank | **#200** |
-| Country rank | **#10 (Germany)** |
+| Country rank | **#10 (France)** |
 | Total participants | **30,703** |
 
 ---
