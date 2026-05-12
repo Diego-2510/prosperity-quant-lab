@@ -57,7 +57,7 @@ The project was intentionally architected as a **research platform**, not a one-
 
 ```
 prosperity-quant-lab/
-├── round3_backtest_montecarlo.py   # Full pipeline: backtest · MC · grid search · BS analytics
+├── backtest_montecarlo.py   # Full pipeline: backtest · MC · grid search · BS analytics
 ├── mean_reversion.py               # Primary competition strategy (z-score market maker)
 ├── requirements.txt                # Pinned dependencies
 └── README.md
