@@ -1,10 +1,29 @@
+# Python
 __pycache__/
-*.pyc
-bt_out/
-bt_out_smoke/
-data/
-data_r1/
-*.csv
-!/examples/**/*.csv
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
 .venv/
+venv/
 .env
+
+# Raw competition data
+data/
+data_r*/
+*.csv
+!examples/**/*.csv
+
+# Generated output
+output/
+results/
+bt_out*/
+analysis_*_quick/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
