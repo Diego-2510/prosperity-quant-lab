@@ -1,0 +1,24 @@
+{
+  "assumptions": {
+    "bot_flow_model": false,
+    "conversions_modelled": false,
+    "default_position_limit": 50,
+    "fill_model": "crossing_orders_only",
+    "passive_queue_model": false,
+    "position_limit_overrides": {
+      "ALPHA": 10
+    }
+  },
+  "final_cash": {
+    "ALPHA": 105.0
+  },
+  "final_positions": {
+    "ALPHA": -1
+  },
+  "metrics": {
+    "fill_count": 3,
+    "final_pnl": 5.0,
+    "max_drawdown": -1.0,
+    "turnover": 301.0
+  }
+}

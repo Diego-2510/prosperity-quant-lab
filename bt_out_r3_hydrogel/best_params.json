@@ -1,0 +1,15 @@
+{
+  "params": {
+    "fair_value": 10002.0,
+    "take_edge": 1.0,
+    "quote_edge": 2.0,
+    "position_size": 60.0,
+    "inventory_skew": 0.5,
+    "flatten_threshold": 60.0
+  },
+  "rank_metric": "sharpe",
+  "mean_profit": -633.834115946627,
+  "sharpe": -0.1556313688130177,
+  "profit_per_trade": -15.436778274394227,
+  "mean_trades_per_path": 41.06
+}

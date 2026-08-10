@@ -1,0 +1,4 @@
+product,price,quantity,day,timestamp
+ALPHA,101,-1,0,200
+ALPHA,98,1,0,300
+ALPHA,102,-1,0,500
